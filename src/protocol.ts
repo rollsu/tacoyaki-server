@@ -7,7 +7,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다.
  *  ⚠ 하루에 두 번 내보내면 날짜만으로는 앞뒤를 가릴 수 없다. 그럴 때만 뒤에 글자를 붙인다
  *    (판 비교는 글자 순서로만 하므로 'b' 가 붙은 쪽이 뒤가 된다). */
-export const SERVER_VERSION = '2026-08-29b'
+export const SERVER_VERSION = '2026-08-30'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -316,6 +316,8 @@ export interface Token {
   memo?: string
   /** 클릭 동작 — 선택 도구에서 클릭 시 이 텍스트를 채팅으로 전송. */
   clickAction?: string
+  /** 클릭 연출 카드 — 클릭 시 이 비주얼 카드를 전원 화면에 재생(채팅 로그 없음 · 서버가 묶임 검증). */
+  clickCardId?: string
   /** 숨김 — true 면 PL 에게 미표시(GM 은 흐리게). GM 전용 토글·전원 동기화. private 공개범위의 레거시 별칭. */
   hidden?: boolean
   /** 공개범위 — all(전체·기본)·owner(나만: 소유자+GM)·private(비공개: GM만)·others(나 외 공개). GM 은 미리보기로 항상 열람. */
@@ -381,6 +383,7 @@ export interface TokenUpsertReq {
   terrain?: boolean
   memo?: string
   clickAction?: string
+  clickCardId?: string
   hidden?: boolean
   visibility?: 'all' | 'owner' | 'private' | 'others'
   backImage?: string
@@ -1223,6 +1226,8 @@ export interface ClientToServerEvents {
   'card:set': (req: VisualCard) => void
   'card:delete': (req: { id: string }) => void
   'card:play': (req: { id: string }) => void
+  /** 토큰 클릭 연출 — 참가자 전용 창구. 서버가 그 토큰에 GM 이 묶어 둔 카드를 찾아 전원 재생(카드 id 위조 불가). */
+  'card:trigger': (req: { mapId: string; tokenId: string }) => void
   /** 맵세트 일괄 가져오기 (GM 전용). 외부 파일에서 변환한 맵들을 서버가 생성해 map:added 로 브로드캐스트.
    *  globalTokens=동반된 통합 레이어(방 상주 패널) — z 보존을 위해 일괄 저장 후 token:state 로 브로드캐스트. */
   'map:import': (req: { maps: GameMap[]; globalTokens?: Token[] }) => void

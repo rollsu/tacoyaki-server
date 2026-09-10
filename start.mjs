@@ -21,6 +21,7 @@ function checkSourceSet() {
   if (!existsSync(listPath)) return []
   try {
     const want = JSON.parse(readFileSync(listPath, 'utf8'))
+    const hex = (b) => createHash('sha256').update(b).digest('hex')
     const odd = []
     for (const [name, hash] of Object.entries(want)) {
       const p = join(srcDir, name)
@@ -28,7 +29,12 @@ function checkSourceSet() {
         odd.push(`${name} (없음)`)
         continue
       }
-      if (createHash('sha256').update(readFileSync(p)).digest('hex') !== hash) odd.push(`${name} (다른 판)`)
+      const raw = readFileSync(p)
+      if (hex(raw) === hash) continue
+      // 줄끝(CRLF/LF)만 다른 사본은 같은 판이다 — 깃 설정(text=auto 등)이 커밋하며 줄끝을 바꿔도
+      // 멀쩡한 배포를 막지 않게, CR 을 걷어낸 바이트로 한 번 더 맞춰 본다(대조표는 LF 기준).
+      if (hex(Buffer.from(raw.toString('utf8').replace(/\r/g, ''), 'utf8')) === hash) continue
+      odd.push(`${name} (다른 판)`)
     }
     return odd
   } catch {
@@ -39,8 +45,10 @@ function checkSourceSet() {
 const odd = checkSourceSet()
 if (odd.length) {
   console.error(
-    `[server] 서버 파일 ${odd.length}개가 없거나 다른 판입니다. 깃허브에 src 폴더를 통째로 다시 올려 주세요(웹 업로드는 한 번에 100개까지만 올라갑니다).\n` +
-      `[server] 어긋난 파일: ${odd.slice(0, 8).join(', ')}${odd.length > 8 ? ` 외 ${odd.length - 8}개` : ''}`
+    `[server] 서버 파일 ${odd.length}개가 없거나 다른 판입니다. 새 판을 올릴 때 파일 일부만 반영되면 이렇게 됩니다.\n` +
+      `[server] 깃허브 웹 업로드는 한 번에 100개까지만 올라갑니다. src 폴더만 따로 통째로 다시 올려 주세요(폴더째 끌어다 놓기).\n` +
+      `[server] 다시 올린 뒤 재배포에서 이 안내가 안 나오면 성공입니다(커밋의 '파일 N개 변경'은 이미 같은 판이던 파일을 빼고 세므로 올린 수보다 적어도 정상).\n` +
+      `[server] 어긋난 파일: ${odd.join(', ')}`
   )
   process.exit(1)
 }

@@ -568,6 +568,8 @@ function coerceToken(t: unknown): Token | null {
     terrain: o.terrain === true ? true : undefined,
     memo: typeof o.memo === 'string' ? o.memo.slice(0, 500) || undefined : undefined,
     clickAction: typeof o.clickAction === 'string' ? o.clickAction.slice(0, 500) || undefined : undefined,
+    // 클릭 연출 카드 묶임 — 디스크 로드·방 불러오기에서도 보존(빠뜨리면 재시작마다 버튼이 풀린다).
+    clickCardId: typeof o.clickCardId === 'string' ? o.clickCardId.slice(0, 64) || undefined : undefined,
     backImage: capImage(o.backImage),
     bars: coerceBars(o.bars),
     statsPrivate: o.statsPrivate === true ? true : undefined,
@@ -4071,6 +4073,12 @@ export class RoomStore {
         typeof req.clickAction === 'string'
           ? req.clickAction.slice(0, 500) || undefined
           : existing?.clickAction,
+      // 클릭 연출 카드 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존. 실존 카드 검사는
+      // 재생 시점(card:trigger)에 한다 — 카드를 먼저 지웠다 다시 만들어도 묶임이 살아 있게.
+      clickCardId:
+        typeof req.clickCardId === 'string'
+          ? req.clickCardId.slice(0, 64) || undefined
+          : existing?.clickCardId,
       // 뒷면 이미지 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존.
       backImage:
         typeof req.backImage === 'string'

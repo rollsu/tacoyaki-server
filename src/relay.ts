@@ -223,6 +223,10 @@ function cardSpeakerOf(m: { playerId?: string; charId?: string }): CardSpeaker {
   return { playerId: m.playerId, charId: m.charId }
 }
 
+/** 토큰 클릭 연출(card:trigger)의 카드별 최근 재생 시각 — 연타가 방 전체 오버레이를 도배하지 않게. */
+const cardTriggerAt = new Map<string, number>()
+const CARD_TRIGGER_COOLDOWN_MS = 2000
+
 /**
  * 비밀 메시지(비밀 굴림·비밀 발화) 수신 대상 개인 룸 — 보낸 사람 + 그 방의 모든 GM.
  * rooms.canSeeMessage(히스토리 열람 규칙)와 같은 집합이어야 한다 — 어긋나면 재입장 뒤에야 보이는 메시지가 생긴다.
@@ -5210,6 +5214,32 @@ export function createRelay(opts?: {
       if (!roomId || !req || typeof req.id !== 'string') return
       const card = store.getVisualCard(roomId, req.id)
       if (card) io.to(roomId).emit('room:cardplay', { card }) // 전원 화면에 오버레이 재생
+    })
+    // 토큰 클릭 연출 — 참가자 전용 창구(GM 불요). 카드 id 를 요청에서 받지 않고 '그 토큰에 GM 이
+    // 묶어 둔 카드(clickCardId)'를 서버에서 찾아 재생한다 — 임의 카드 위조 방송 차단. 통합 레이어
+    // 토큰은 요청 맵에 없으므로 GLOBAL 폴백. 카드별 짧은 스로틀로 연타 도배를 막는다.
+    on('card:trigger', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.tokenId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const token =
+        store.getToken(roomId, req.mapId, req.tokenId) ??
+        store.getToken(roomId, GLOBAL_MAP_ID, req.tokenId)
+      if (!token?.clickCardId) return
+      // 앞면을 볼 수 있는 뷰어만 — 뒷면/비공개 토큰의 와이어 표현은 묶임을 벗겨 보내므로(tokenForViewer)
+      // 정상 클라는 애초에 못 쏘지만, 조작 클라가 id 만으로 GM 이 감춘 연출을 강제 재생하는 길을 서버가 막는다.
+      if (!canSeeToken(token, { playerId, role: me.role })) return
+      const card = store.getVisualCard(roomId, token.clickCardId)
+      if (!card) return
+      const key = roomId + ':' + card.id
+      const now = Date.now()
+      const last = cardTriggerAt.get(key) ?? 0
+      if (now - last < CARD_TRIGGER_COOLDOWN_MS) return
+      if (cardTriggerAt.size > 2000) cardTriggerAt.clear() // 방·카드 조합 누적 방지(쿨다운 짧아 리셋 무해)
+      cardTriggerAt.set(key, now)
+      io.to(roomId).emit('room:cardplay', { card })
     })
 
     // ===== 덱(카드 뭉치) =====
