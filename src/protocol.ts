@@ -48,6 +48,23 @@ export interface MadnessTables {
   summary: string[]
 }
 
+/**
+ * GM 커스텀 인세인 표 항목 — entries 만 있으면 룰셋에 있는 표의 항목 덮어쓰기.
+ * label/dice 까지 있으면(룰셋에 없는 새 id) GM 이 세션 중에 추가한 표 — 클라가 룰셋 표와 합쳐서 보여준다.
+ */
+export interface InsaneTableOverride {
+  label?: string
+  dice?: string
+  entries: string[]
+}
+
+/**
+ * GM 커스텀 인세인 표(재구성) — 룰셋의 임의 표 id(배드엔딩·장면표·감정표 등)를 키로 하는 맵.
+ * 광기표와 달리 표 개수·id 가 룰셋마다 다르므로 고정 필드 대신 맵으로 둔다.
+ * 미설정/빈 표면 클라 기본 룰셋 표로 폴백. GM 설정·전원 동기화·영속.
+ */
+export type InsaneTables = Record<string, InsaneTableOverride>
+
 export interface ChatMessage {
   id: string
   time: number // epoch ms
@@ -316,6 +333,8 @@ export interface Token {
   memo?: string
   /** 클릭 동작 — 선택 도구에서 클릭 시 이 텍스트를 채팅으로 전송. */
   clickAction?: string
+  /** 클릭 연출 카드 — 클릭 시 이 비주얼 카드를 전원 화면에 재생(채팅 로그 없음 · 서버가 묶임 검증). */
+  clickCardId?: string
   /** 숨김 — true 면 PL 에게 미표시(GM 은 흐리게). GM 전용 토글·전원 동기화. private 공개범위의 레거시 별칭. */
   hidden?: boolean
   /** 공개범위 — all(전체·기본)·owner(나만: 소유자+GM)·private(비공개: GM만)·others(나 외 공개). GM 은 미리보기로 항상 열람. */
@@ -381,6 +400,7 @@ export interface TokenUpsertReq {
   terrain?: boolean
   memo?: string
   clickAction?: string
+  clickCardId?: string
   hidden?: boolean
   visibility?: 'all' | 'owner' | 'private' | 'others'
   backImage?: string
@@ -775,6 +795,8 @@ export interface RoomState {
   globalTokens?: Token[]
   /** GM 커스텀 광기표 — 미설정이면 클라 기본 7판 표 사용. 전원 동기화. */
   madnessTables?: MadnessTables
+  /** GM 커스텀 인세인 표(배드엔딩·장면표·감정표 등) — 미설정이면 클라 기본 룰셋 표 사용. 전원 동기화. */
+  insaneTables?: InsaneTables
   /** 행운 깎기(CoC7 하우스룰) 사용 여부 — GM 토글·전원 동기화. 미설정/true=사용, false=비활성. */
   luckEnabled?: boolean
   /** 일반 맵 VN 오버레이(대사창+발화자 스탠딩) 표시 — GM 토글·전원 동기화. 미설정/false=꺼짐, true=켜짐. */
@@ -1159,6 +1181,8 @@ export interface ClientToServerEvents {
   'room:gmwhisper': (req: { enabled: boolean }) => void
   // GM 커스텀 광기표 설정(GM 전용) — 서버 정규화 후 전원 동기화.
   'room:madness': (req: MadnessTables) => void
+  // GM 커스텀 인세인 표 설정(GM 전용) — 서버 정규화 후 전원 동기화. 표 id → 문자열 배열 맵.
+  'room:insaneTables': (req: InsaneTables) => void
   // BGM (다중, GM 전용). set=트랙 추가/로드(소스 포함·최대 5), control=해당 트랙 재생/반복/볼륨 토글, clear=한 트랙(trackId) 또는 전체 정지.
   'bgm:set': (req: {
     trackId: string
@@ -1223,6 +1247,8 @@ export interface ClientToServerEvents {
   'card:set': (req: VisualCard) => void
   'card:delete': (req: { id: string }) => void
   'card:play': (req: { id: string }) => void
+  /** 토큰 클릭 연출 — 참가자 전용 창구. 서버가 그 토큰에 GM 이 묶어 둔 카드를 찾아 전원 재생(카드 id 위조 불가). */
+  'card:trigger': (req: { mapId: string; tokenId: string }) => void
   /** 맵세트 일괄 가져오기 (GM 전용). 외부 파일에서 변환한 맵들을 서버가 생성해 map:added 로 브로드캐스트.
    *  globalTokens=동반된 통합 레이어(방 상주 패널) — z 보존을 위해 일괄 저장 후 token:state 로 브로드캐스트. */
   'map:import': (req: { maps: GameMap[]; globalTokens?: Token[] }) => void
@@ -1401,6 +1427,8 @@ export interface ServerToClientEvents {
   'room:gmwhisper': (req: { enabled: boolean }) => void
   // GM 커스텀 광기표 브로드캐스트.
   'room:madness': (req: MadnessTables) => void
+  // GM 커스텀 인세인 표 브로드캐스트.
+  'room:insaneTables': (req: InsaneTables) => void
   // BGM 브로드캐스트 (다중). state=트랙 목록 전체(소스 포함·추가/제거 시), control=경량 트랙 토글(재생/반복/볼륨).
   // roomId=발신 방 표식 — 수신 클라가 자기 방 방송인지 검증(방 이동 직후 이전 방 음악이 새는 것 차단). 구클라는 무시.
   'bgm:state': (tracks: BgmState[], roomId?: string) => void
