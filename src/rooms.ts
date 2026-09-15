@@ -35,6 +35,7 @@ import type {
   GridConfig,
   HandoutScope,
   HandoutUpsertReq,
+  InsaneTables,
   MadnessTables,
   MapBackground,
   MapBackdrop,
@@ -181,6 +182,7 @@ export interface Room {
   cutInImages?: Partial<Record<SuccessLevel, string>> // 성공 단계별 연출 카드(GM 설정 · 전원 동기화)
   dimColor?: string // ~문장~ 행동지문 색(GM 설정 · 전원 동기화 · hex)
   madnessTables?: MadnessTables // GM 커스텀 광기표 — 미설정이면 클라 기본 표. 전원 동기화·영속.
+  insaneTables?: InsaneTables // GM 커스텀 인세인 표(배드엔딩·장면표·감정표 등) — 미설정이면 클라 기본 룰셋 표. 전원 동기화·영속.
   /**
    * 입실 잠금(공사중). 켜면 방을 만든 사람 말고는 못 들어온다 — 준비 중인 방에 초대 코드를 아는
    * 사람이 불쑥 들어오는 것을 막는다. 이미 들어와 있는 사람은 내보내지 않는다. 영속.
@@ -568,6 +570,8 @@ function coerceToken(t: unknown): Token | null {
     terrain: o.terrain === true ? true : undefined,
     memo: typeof o.memo === 'string' ? o.memo.slice(0, 500) || undefined : undefined,
     clickAction: typeof o.clickAction === 'string' ? o.clickAction.slice(0, 500) || undefined : undefined,
+    // 클릭 연출 카드 묶임 — 디스크 로드·방 불러오기에서도 보존(빠뜨리면 재시작마다 버튼이 풀린다).
+    clickCardId: typeof o.clickCardId === 'string' ? o.clickCardId.slice(0, 64) || undefined : undefined,
     backImage: capImage(o.backImage),
     bars: coerceBars(o.bars),
     statsPrivate: o.statsPrivate === true ? true : undefined,
@@ -813,6 +817,46 @@ function coerceMadnessTables(v: unknown): MadnessTables | undefined {
   const summary = norm(o.summary)
   if (realtimeTemp.length === 0 && realtimeIndef.length === 0 && summary.length === 0) return undefined
   return { realtimeTemp, realtimeIndef, summary }
+}
+
+/** 인세인 커스텀 표 키(=룰셋 표 id 또는 GM 이 세션 중 추가한 새 표 id) 화이트리스트 — 와이어 위조로 임의 문자열이 객체 키로 들어오는 것 방지. */
+const INSANE_TABLE_KEY_RE = /^[A-Za-z0-9_가-힣]{1,64}$/
+/** GM 이 새 표에 지정하는 주사위 표기(예: 1d6, 2d10) 형식 검증. */
+const INSANE_TABLE_DICE_RE = /^\d{1,2}d\d{1,3}$/i
+
+/**
+ * GM 커스텀 인세인 표 정규화 — 표 id(가변) → { label?, dice?, entries } 맵.
+ * entries 만 있으면(label/dice 없음) 룰셋 표의 항목 덮어쓰기. label 까지 있으면 GM 이 세션 중 추가한 새 표.
+ * 표 개수 최대 30개, 표당 항목 최대 40개·각 500자, label 최대 60자.
+ * 모든 표의 entries 가 빈 배열이고 label 도 없으면 undefined(=완전 해제, 클라 기본 룰셋 표로 폴백).
+ */
+function coerceInsaneTables(v: unknown): InsaneTables | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  const normEntries = (a: unknown): string[] =>
+    (Array.isArray(a) ? a : [])
+      .filter((s): s is string => typeof s === 'string')
+      .slice(0, 40)
+      .map((s) => s.slice(0, 500))
+  const out: InsaneTables = {}
+  let hasAny = false
+  for (const key of Object.keys(o).slice(0, 30)) {
+    if (!INSANE_TABLE_KEY_RE.test(key)) continue
+    const raw = o[key]
+    if (!raw || typeof raw !== 'object') continue
+    const r = raw as Record<string, unknown>
+    const entries = normEntries(r.entries)
+    const label =
+      typeof r.label === 'string' && r.label.trim() ? r.label.trim().slice(0, 60) : undefined
+    const dice =
+      typeof r.dice === 'string' && INSANE_TABLE_DICE_RE.test(r.dice.trim())
+        ? r.dice.trim().toLowerCase()
+        : undefined
+    if (entries.length === 0 && !label) continue
+    out[key] = { entries, ...(label ? { label } : {}), ...(dice ? { dice } : {}) }
+    hasAny = true
+  }
+  return hasAny ? out : undefined
 }
 
 /**
@@ -1282,6 +1326,7 @@ function roomToFile(room: Room): Record<string, unknown> {
     cutInImages: room.cutInImages,
     dimColor: room.dimColor,
     madnessTables: room.madnessTables, // GM 커스텀 광기표
+    insaneTables: room.insaneTables, // GM 커스텀 인세인 표
     luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
     locked: room.locked, // 입실 잠금(공사중)
     vnOverlay: room.vnOverlay, // 일반 맵 VN 오버레이 표시 여부
@@ -1393,6 +1438,7 @@ function roomFromFile(data: unknown): Room | null {
     cutInImages: coerceCutInImages(o.cutInImages),
     dimColor: coerceDimColor(o.dimColor),
     madnessTables: coerceMadnessTables(o.madnessTables), // GM 커스텀 광기표
+    insaneTables: coerceInsaneTables(o.insaneTables), // GM 커스텀 인세인 표
     locked: o.locked === true ? true : undefined, // 입실 잠금(공사중)
     luckEnabled: typeof o.luckEnabled === 'boolean' ? o.luckEnabled : undefined, // 행운 깎기 사용 여부(미설정=기본 사용)
     vnOverlay: typeof o.vnOverlay === 'boolean' ? o.vnOverlay : undefined, // VN 오버레이 표시 여부(미설정=꺼짐)
@@ -2831,6 +2877,15 @@ export class RoomStore {
     return { ok: true, tables: room.madnessTables }
   }
 
+  /** GM 커스텀 인세인 표 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). 빈/무효면 해제(기본 룰셋 표). {ok,tables} 반환. */
+  setInsaneTables(roomId: string, tables: unknown): { ok: boolean; tables?: InsaneTables } {
+    const room = this.rooms.get(roomId)
+    if (!room) return { ok: false }
+    room.insaneTables = coerceInsaneTables(tables)
+    room.lastActivityAt = Date.now()
+    return { ok: true, tables: room.insaneTables }
+  }
+
   /**
    * 입실 잠금(공사중) 설정 — 방을 만든 사람 말고는 못 들어오게 한다.
    * 이미 들어와 있는 사람은 내보내지 않는다(준비 중에 문만 닫는 것이지 쫓아내는 기능이 아니다).
@@ -4071,6 +4126,12 @@ export class RoomStore {
         typeof req.clickAction === 'string'
           ? req.clickAction.slice(0, 500) || undefined
           : existing?.clickAction,
+      // 클릭 연출 카드 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존. 실존 카드 검사는
+      // 재생 시점(card:trigger)에 한다 — 카드를 먼저 지웠다 다시 만들어도 묶임이 살아 있게.
+      clickCardId:
+        typeof req.clickCardId === 'string'
+          ? req.clickCardId.slice(0, 64) || undefined
+          : existing?.clickCardId,
       // 뒷면 이미지 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존.
       backImage:
         typeof req.backImage === 'string'
@@ -4775,6 +4836,11 @@ export class RoomStore {
             summary: [...src.madnessTables.summary]
           }
         : undefined,
+      insaneTables: src.insaneTables
+        ? Object.fromEntries(
+            Object.entries(src.insaneTables).map(([k, ov]) => [k, { ...ov, entries: [...ov.entries] }])
+          )
+        : undefined,
       // 잠금은 복제본에 옮기지 않는다 — 복사한 방은 새로 준비하는 방이라 문을 열어 둔 채 시작한다.
       luckEnabled: src.luckEnabled, // 행운 깎기 사용 여부 복제
       vnOverlay: src.vnOverlay, // VN 오버레이 표시 여부 복제
@@ -4854,6 +4920,7 @@ export class RoomStore {
       cutInImages: room.cutInImages,
       dimColor: room.dimColor,
       madnessTables: room.madnessTables, // GM 커스텀 광기표
+      insaneTables: room.insaneTables, // GM 커스텀 인세인 표
       locked: room.locked, // 입실 잠금(공사중)
       luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
       vnOverlay: room.vnOverlay, // VN 오버레이 표시 여부
