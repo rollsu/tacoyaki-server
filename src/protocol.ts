@@ -18,6 +18,7 @@ export type MessageKind =
   | 'narration'
   | 'dice'
   | 'madness'
+  | 'table'
   | 'script'
   | 'system'
   | 'choice'
@@ -46,6 +47,15 @@ export interface MadnessTables {
   realtimeTemp: string[]
   realtimeIndef: string[]
   summary: string[]
+}
+
+/** 인세인 표 굴림 결과(kind='table') — 광기의 발작(madness)의 인세인판. 클라가 표를 굴려 결과 payload 전송, 서버는 그대로 중계. */
+export interface TableRoll {
+  label: string
+  dice: string
+  roll: number
+  sides: number
+  entry: string
 }
 
 /**
@@ -89,6 +99,8 @@ export interface ChatMessage {
   dice?: DiceResult
   /** 광기의 발작 카드(kind='madness'). */
   madness?: MadnessRoll
+  /** 인세인 표 굴림 결과(kind='table'). */
+  table?: TableRoll
   to?: string
   /** 그룹 채널 id — channel==='group' 일 때 어느 그룹 채널인지. */
   groupId?: string
@@ -880,9 +892,10 @@ export interface ChatSendReq {
  */
 export interface ChatRollReq {
   channel: ChatChannel
-  kind: 'dice' | 'madness'
+  kind: 'dice' | 'madness' | 'table'
   dice?: DiceResult
   madness?: MadnessRoll
+  table?: TableRoll
   to?: string
   groupId?: string
   secret?: boolean
