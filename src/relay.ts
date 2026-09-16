@@ -1,5166 +1,5997 @@
-// 방 스토어 — 서버가 방/참가자/메시지의 진실원본.
-// 세션방 영속: persist 모드면 방을 <dataDir>/rooms/<id>.json 에 저장(장면·메타·멤버·전체 채팅).
-// 시작 시 로드, 변경 시 주기적 자동저장(lastActivityAt 기준 dirty flush). 방은 소유자 삭제 전까지 유지(유휴 정리 안 함).
-import { randomUUID } from 'node:crypto'
+// Socket.IO 릴레이 조립 (listen 은 하지 않음 → 테스트에서 임의 포트로 재사용).
+import { createServer, type Server as HttpServer, type ServerResponse } from 'node:http'
 import {
-  readFileSync,
-  existsSync,
-  readdirSync,
-  unlinkSync,
-  appendFileSync,
-  writeFileSync,
+  createReadStream,
   statSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
   mkdirSync,
-  truncateSync,
-  openSync,
-  readSync,
-  closeSync
+  renameSync,
+  type Dirent
 } from 'node:fs'
-import { mkdir, writeFile, rename, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
-import { capImage, capImageList, capId, clampCoord } from './limits'
-import { collectAssetRefs as scanAssetRefs, dataUrlHash } from './assets'
+import { join, relative, sep } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { getHeapStatistics } from 'node:v8'
+import { Server } from 'socket.io'
 import type {
-  Appearance,
-  BgmState,
-  Channel,
-  Combatant,
-  CombatState,
+  CharIdentityReq,
+  ChatChannel,
   ChatMessage,
-  DeckCard,
-  DeckUpsertReq,
-  DeckView,
-  Handout,
+  ClientToServerEvents,
   GameMap,
-  GridConfig,
-  HandoutScope,
-  HandoutUpsertReq,
-  InsaneTables,
-  MadnessTables,
-  MapBackground,
-  MapBackdrop,
-  MapText,
-  MapTextUpsertReq,
-  Participant,
-  RoomLoadReq,
+  Handout,
+  PresenceStatus,
+  ProfileLink,
+  ProfileTheme,
+  PublicPresenceStatus,
   RoomState,
+  ServerToClientEvents,
   SharedCharacter,
-  Stroke,
-  Token,
-  TokenBar,
-  TokenLayer,
-  TokenPlacePlReq,
-  TokenUpsertReq,
-  TokenZOp,
-  VnLayer
+  SocketData,
+  Token
 } from './protocol'
-import { GLOBAL_MAP_ID, MAX_TOKEN_CELLS } from './protocol'
-import type { SuccessLevel } from './dice/types'
+import { GLOBAL_MAP_ID, SERVER_VERSION } from './protocol'
+import type { IncomingMessage } from 'node:http'
+import type { Server as HttpsServer } from 'node:https'
+import { createServer as createHttpsServer } from 'node:https'
+import { RoomStore, canViewHandout, canSeeToken, tokenForViewer, tokenVisibility, type Room, type CardSpeaker } from './rooms'
+import { parseCommand, resolveInlineRolls, allCardKeywords, diceCardKeywords } from './dice/engine'
+import { createAuthStore, type AuthStore, type PublicAccount } from './auth'
+import { createCharacterStore, type CharacterStore } from './characters'
+import { createAssetStore, collectAssetRefs as scanAssetRefs, type AssetStore } from './assets'
+import { createDmStore, MAX_GROUP_MEMBERS, type DmStore } from './dm'
+import { createNotifStore, type NotifStore, type NotifInput } from './notifications'
+import { createPostStore, type PostStore } from './posts'
+import { createSessionLogStore, type SessionLogStore } from './sessionlogs'
+import { createDottownStore, type DottownStore } from './dottown'
+import { createEconomyStore, type EconStore } from './dottownEconomy'
+import { createEstateStore, type EstateStore } from './dottownEstate'
+import { createMarketStore, type MarketStore } from './market'
+import { createCommunityStore, type CommunityStore } from './community'
+import { createCommunityPostStore, type CommunityPostStore } from './communityPost'
+import { createCommunityCharStore, type CommunityCharStore } from './communityChar'
+import { createCommunityCatalog, type CommunityCatalog } from './communityCatalog'
+import { createCommunityLedger, type CommunityLedger } from './communityLedger'
+import { createCommunityGiftStore, type CommunityGiftStore } from './communityGift'
+import { createCommunityEcon, type CommunityEcon } from './communityEcon'
+import { createCommunityGames, type CommunityGames } from './communityGame'
+import { createCommunityQuest, type CommunityQuest } from './communityQuest'
+import { createCommunitySurvey, type CommunitySurvey } from './communitySurvey'
+import { createCommunityRoutes } from './communityRoutes'
+import { createPlazaHub, PLAZA_ID } from './plaza'
+import { createRoomPresenceHub } from './roomPresence'
+import { isFiniteCoord, clampCoord, MAX_CHAT_CHARS, isOversizedInline } from './limits'
 
-/** 버퍼를 줄 단위로 자른다 — 큰 기록장을 통째로 문자열로 만들지 않기 위해. */
-function splitLines(buf: Buffer): Buffer[] {
-  const out: Buffer[] = []
-  let start = 0
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === 0x0a) {
-      out.push(buf.subarray(start, i))
-      start = i + 1
-    }
-  }
-  if (start < buf.length) out.push(buf.subarray(start))
-  return out
+/** PNG 시그니처 검증 + IHDR 폭·높이 파싱(sharp 없이). PNG 가 아니거나 손상 시 null. 마켓 업로드 검증용. */
+function pngDimensions(bytes: Buffer): { w: number; h: number } | null {
+  // 8바이트 시그니처 + IHDR(len4+type4+w4+h4) → 최소 24바이트.
+  if (bytes.length < 24) return null
+  const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+  for (let i = 0; i < 8; i++) if (bytes[i] !== SIG[i]) return null
+  if (bytes.toString('ascii', 12, 16) !== 'IHDR') return null
+  const w = bytes.readUInt32BE(16)
+  const h = bytes.readUInt32BE(20)
+  if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return null
+  return { w, h }
 }
 
-/** 저장이 이만큼 넘게 안 끝나면 매달린 것으로 보고 관리 화면에 알린다. */
-const STUCK_FLUSH_MS = 60_000
-/**
- * 방이 메모리에 들고 있는 대화 수 — 입장할 때 통째로 내려보내는 몫이라 무한정 늘릴 수 없다.
- * 여기서 넘치는 앞부분은 **버리지 않고** 보관소(<방>.archive.NNN.jsonl)로 옮긴다(evictOldest).
- * 보관분은 채팅 창의 '보관된 이전 대화 불러오기'로 언제든 되읽는다.
- */
-// ⚠ 클라 런타임 상한(src/renderer/src/store/useChatStore.ts 의 RUNTIME_CHAT_LIMIT)과 같은 값이어야 한다.
-// 클라가 더 작으면 입장할 때 받은 앞부분을 도로 버려 화면·내보내기에서 대화가 사라진다.
-const MAX_HISTORY = 20000
-/** 보관소 한 조각의 크기 상한 — 넘으면 다음 번호로 넘어간다(되읽을 때 한 조각만 읽으면 되게). */
-const ARCHIVE_PART_BYTES = 8 * 1024 * 1024
-/** 보관소 조각 번호 상한. 여기 닿으면 마지막 조각을 계속 키운다 — 늦게 읽힐지언정 잃지는 않는다. */
-const ARCHIVE_PART_MAX = 999
-/** 되읽기 한 번에 훑는 보관 줄 수 상한 — 볼 수 없는 대화만 이어져도 요청 하나가 오래 붙들지 않게. */
-const ARCHIVE_SCAN_LIMIT = 4000
-/** 되읽기 한 번에 돌려주는 대화 수 상한. */
-const ARCHIVE_PAGE_MAX = 500
-/** 계정 이전 내보내기에 실을 보관 대화 수 상한 — 통째로 메모리에 올리는 길이라 끝을 둔다. */
-const ARCHIVE_EXPORT_MAX = 200_000
-/** 읽어 둔 채로 들고 있는 보관 조각 수 — 여러 사람이 서로 다른 방을 번갈아 읽어도 재파싱이 잦지 않게. */
-const ARCHIVE_PAGE_CACHE = 4
-/** 보관 조각의 두상 사전 줄에서 열쇠(자산 해시)만 뽑는다 — 그림 목록을 조각에서 되세울 때 쓴다. */
-const ARCHIVE_AVATAR_KEY_RE = /"op":"av","k":"([0-9a-f]{64})"/g
-/** 한 번에 보관소로 옮기는 대화 수 상한 — 쓰기가 막혔을 때 매 마디마다 밀린 전량을 다시 직렬화하지 않게. */
-const ARCHIVE_APPEND_MAX = 2000
-/** 보관에 실패한 방이 다시 시도하기까지 쉬는 시간 — 막힌 디스크를 말 한 마디마다 두드리지 않게. */
-const ARCHIVE_RETRY_MS = 30_000
-/**
- * 보관이 막혀도 방이 메모리에 들고 있을 수 있는 마지막 선.
- * 여기 닿으면 사본 없이 앞부분을 버린다 — 아까운 일이지만, 그대로 두면 그 방 하나가 서버를 세워
- * 다른 모든 방의 최근 대화까지 함께 잃는다. 버린 사실은 관리 화면에 지워지지 않는 경고로 남긴다.
- */
-const MAX_HISTORY_HARD = MAX_HISTORY * 2
-/** 캐릭터 보관대 상한 — 한 방에서 오간 저널이 아무리 많아도 이만큼만 남긴다(오래된 것부터 덜어 낸다). */
-const MAX_CHAR_POOL = 200
-/** 한 사람이 보관대에 남길 수 있는 항목 수 — 공용 상한만 있으면 한 사람이 charId 를 바꿔 가며
- *  풀 전체를 채워 다른 사람·GM 의 항목(토큰·화자 각인의 근거)을 조용히 밀어낼 수 있다. */
-const MAX_CHAR_POOL_PER_PLAYER = 16
-/** 맵당 오브젝트 개수 상한 — 방 상태 팽창 방어(coerceLoadedMap 모든 진입점 적용). */
-const MAX_TOKENS_PER_MAP = 2000
-/** 1인당 참가자 창작 오브젝트(ownerPlayerId 스탬프) 상한 — 방 전체(모든 맵) 합산. 초과 배치는 무시. */
-const MAX_PL_OBJECTS_PER_PLAYER = 30
-/** 방이 들고 있는 GM 선택지 개수 상한 — 넘으면 오래된 것부터 버린다(옵션 스크립트가 무거워 무제한 불가). */
-const MAX_ROOM_CHOICES = 100
-const MAX_DRAWINGS_PER_MAP = 2000
-/** 방이 들고 있는 덱 수 상한 — 방 파일과 입장 스냅샷에 통째로 실리므로 끝을 둔다. */
-const MAX_DECKS = 12
-/** 방이 들고 있는 비주얼 카드 수 상한. 화자를 갈라 같은 이름으로 여러 장을 두는 쓰임이 생겨 넉넉히 잡는다. */
-const MAX_VISUAL_CARDS = 60
-/** 카드 한 장에 매어 둘 수 있는 화자 수 — 목록이 방 파일과 스냅샷에 그대로 실리므로 끝을 둔다. */
-const MAX_CARD_SPEAKERS = 16
-/** 한 덱의 카드 정의 수 상한(그림이 붙을 수 있어 넉넉하되 무한은 아니게). */
-const MAX_DECK_CARDS = 120
-/** 같은 카드를 몇 장까지 넣을 수 있는지 — 남은 더미가 카드 정의 수보다 지나치게 부풀지 않게. */
-const MAX_DECK_CARD_COUNT = 99
-/** 한 덱의 총 장수 상한(count 합) — 섞기가 만드는 배열의 크기. */
-const MAX_DECK_TOTAL = 400
-/** 한 번에 뽑을 수 있는 장수. */
-const MAX_DECK_DRAW = 10
-const MAX_TEXTS_PER_MAP = 1000
-
-/** 서버 내부 맵세트 — 토큰은 빠른 조회 위해 Map. 와이어 전송 시 toWireMap 으로 배열화. */
-export interface RoomMap {
-  id: string
-  name: string
-  background: MapBackground | null
-  grid: GridConfig
-  tokens: Map<string, Token> // key: token id
-  drawings: Map<string, Stroke> // key: stroke id (자유 드로잉, 삽입 순서 = z 순서)
-  texts: Map<string, MapText> // key: text id (맵 텍스트 라벨)
-  vnBackground?: string // 비주얼 노벨 무대 배경(data URL) — 맵세트별, 전술 배경과 별개
-  vnBackgroundBlur?: number // 비주얼 노벨 배경 흐림 강도(0~40 · 없으면 0)
-  vnLayers?: VnLayer[] // 비주얼 노벨 무대 레이어 스택 — vnBackground 위에 z순
-  bgColor?: string // 맵 배경 단색(여백 전체) — 캔버스 전체 채움. hex. 없으면 투명
-  backdrop?: MapBackdrop // 맵 바탕(최후면 이미지+블러) — 무대 바깥 여백까지 화면 전체를 덮음
-  crossfade?: boolean // 크로스페이드 — 이 맵으로 전환 시 페이드 연출
-  hiddenLayers?: TokenLayer[] // 숨긴 레이어(무대 앞 밴드·무대 뒤) — GM 설정·맵 단위 전원 동기
-  bgm?: BgmState[] // 맵세트 번들 BGM 스냅샷(자산 참조). undefined=미저장, []=무음 저장
-  importId?: string // 가져오기 출처 태그 — 같은 파일 배치의 맵·통합 레이어 연동 삭제용(불변)
-}
-
-export interface Room {
-  id: string
-  code: string
-  title: string // 세션방 이름(목록 표시)
-  ownerId: string // 소유자 계정 id(목록·삭제·복사·메타 권한). 비인증이면 playerId 폴백
+export interface Relay {
+  httpServer: HttpServer | HttpsServer
+  io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>
+  store: RoomStore
+  auth: AuthStore
+  characters: CharacterStore
+  assets: AssetStore
+  dm: DmStore
+  notif: NotifStore
+  posts: PostStore
+  sessionlogs: SessionLogStore
+  dottown: DottownStore
+  economy: EconStore
+  market: MarketStore
   /**
-   * 공동 GM 계정 id — 소유자가 방 안에서 지정한다. 영속.
-   *
-   * 소유자는 언제나 GM 이므로 여기 담지 않는다(담으면 양도할 때 두 곳을 맞춰야 하는 이중 원본이 된다).
-   * 참가자 레코드의 role 은 이 집합에서 파생된다 — 나갔다 들어와도, 서버가 다시 켜져도 자격이 남는다.
+   * DM 목록이 자산으로 옮겨 놓은 프사의 해시를 보존 집합에 싣는다.
+   * ⚠주기 자산 회수(index.ts runAssetGc)에 반드시 함께 불러야 한다 — 계정 파일에는 원본 그림이 그대로
+   * 남아 이 참조를 아무도 안 가리키므로, 빠뜨리면 DM 목록 프사가 최대 6시간 뒤 조용히 사라진다.
    */
-  gmIds: Set<string>
-  members: Set<string> // 참여한 적 있는 계정 id(목록용 · 소유자 포함)
-  cardImage?: string // 세션 카드 이미지(1200×600 data URL)
-  participants: Map<string, Participant> // key: playerId
-  characters: Map<string, SharedCharacter> // key: playerId (프레즌스 서브셋 · 지금 장착한 캐릭터 한 명)
-  /**
-   * 캐릭터 보관대 — key: playerId + charId. 로스터에서 밀려난 캐릭터도 여기 남아,
-   * 맵에 놓아 둔 그 캐릭터의 토큰이 이름·색·두상·수치를 잃지 않는다. 영속.
-   */
-  charPool: Map<string, SharedCharacter>
-  handouts: Map<string, Handout> // key: handout id (GM 자료)
-  maps: Map<string, RoomMap> // key: map id (맵세트)
-  activeMapId: string // 전원이 보는 활성 맵
-  appearance: Appearance // 방 GM 강제 테마·다이스 카드
-  cutInImage?: string // 방 주사위 연출 카드 이미지(data URL · GM 설정 · 레벨별 미설정 시 공통 폴백)
-  cutInImages?: Partial<Record<SuccessLevel, string>> // 성공 단계별 연출 카드(GM 설정 · 전원 동기화)
-  dimColor?: string // ~문장~ 행동지문 색(GM 설정 · 전원 동기화 · hex)
-  madnessTables?: MadnessTables // GM 커스텀 광기표 — 미설정이면 클라 기본 표. 전원 동기화·영속.
-  insaneTables?: InsaneTables // GM 커스텀 인세인 표(배드엔딩·장면표·감정표 등) — 미설정이면 클라 기본 룰셋 표. 전원 동기화·영속.
-  /**
-   * 입실 잠금(공사중). 켜면 방을 만든 사람 말고는 못 들어온다 — 준비 중인 방에 초대 코드를 아는
-   * 사람이 불쑥 들어오는 것을 막는다. 이미 들어와 있는 사람은 내보내지 않는다. 영속.
-   */
-  locked?: boolean
-  luckEnabled?: boolean // 행운 깎기(CoC7 하우스룰) 사용 여부 — GM 토글·전원 동기화·영속. 미설정=사용(기본).
-  vnOverlay?: boolean // 일반 맵 위 VN 오버레이(대사창+발화자 스탠딩) 표시 — GM 토글·전원 동기화·영속. 미설정=꺼짐.
-  plObjects?: boolean // 참가자 오브젝트 추가 허용(이미지 토큰·스티커) — GM 토글·전원 동기화·영속. 미설정=꺼짐.
-  /**
-   * GM 의 귓속말 열람. 켜 두면 그 뒤로 오가는 1:1 귓속말이 GM 에게도 전달된다 — GM 토글·전원 동기화·영속.
-   * 미설정=꺼짐. 열림 여부는 방 설정이 아니라 말마다 찍히는 각인(ChatMessage.gmVisible)이 정하므로,
-   * 켜기 전에 오간 말은 나중에 켜도 열리지 않는다(뒤늦게 지난 사생활이 통째로 드러나지 않게).
-   */
-  gmSeeWhispers?: boolean
-  bgm: BgmState[] // 방 BGM 트랙들 (다중, GM 제어·전원 동기화 · 최대 5)
-  combat: CombatState | null // 방 전투 상태 (GM 제어·전원 동기화 · in-memory, 비영속)
-  saveSlots?: SaveSlot[] // 저장 슬롯(반면 전체 명명 저장 · GM · 최대 3 · 영속)
-  visualCards?: VisualCard[] // 비주얼 카드 — GM 등록·전원 동기화 · 영속
-  /**
-   * 덱(카드 뭉치) — GM 이 만들고 방 전원이 뽑는다. 영속.
-   * 남은 더미(draw)는 서버만 들고 있는다 — 내보내면 다음에 무엇이 나올지가 그대로 새어 나간다.
-   */
-  decks?: Deck[]
-  globalTokens?: Map<string, Token> // 통합 레이어 — 맵세트를 넘어 모든 맵세트에 유지되는 토큰. key=token id · 영속
-  channels: Map<string, Channel> // 그룹 채널(GM 개설·영속). key=channelId
-  /** GM 선택지 — key=선택지 메시지 id. 옵션(스크립트 포함·비공개) + 이미 응답한 사람. 영속.
-   *  영속이 아니면 서버가 한 번 재시작하는 순간 화면에 남은 선택지 카드가 전부 죽은 단추가 된다
-   *  (눌러도 서버가 모르는 선택지라 조용히 무시). 최근 MAX_ROOM_CHOICES 개만 보관. */
-  choices?: Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }>
-  messages: ChatMessage[]
-  /** 방별 캐릭터 시트 멤버십 — playerId(=계정) → 이 방에 속한 charId[]. 영속. 시트 데이터는 계정 라이브러리에. */
-  charRooms: Map<string, string[]>
-  createdAt: number
-  lastActivityAt: number
+  listAvatarRefs: (into: Set<string>) => void
 }
 
-/**
- * 덱의 서버 보관본 — 공개본(DeckView)에 '남은 더미'를 더한 것.
- * draw 는 카드 정의 id 를 장수만큼 늘어놓고 섞은 배열이며, 뒤에서 하나씩 꺼내 쓴다.
- */
-interface Deck {
-  id: string
-  name: string
-  cards: DeckCard[]
-  /** 남은 더미(정의 id · 뒤에서 뽑는다). 서버 밖으로 내보내지 않는다. */
-  draw: string[]
-  /**
-   * 버린 더미(뽑은 순서). by 가 있으면 '비밀로' 뽑은 것이라 그 사람과 GM 에게만 보인다 —
-   * 없으면 공개 뽑기라 전원이 본다. 게임 규칙에는 쓰이지 않는 표시용이라 사람마다 잘라 보내도 안전하다
-   * (섞기·자동 섞기는 언제나 카드 정의에서 한 벌을 새로 만든다).
-   */
-  discard: { id: string; by?: string }[]
-  announce: boolean
-  reshuffle: boolean
-  revealCards: boolean
-  who: 'all' | 'gm'
-  createdAt: number
-}
-
-/** 저장 슬롯 — 반면(맵·활성맵·BGM)을 이름 붙여 통째 저장. 최대 3 · 영속(디스크). */
-export interface SaveSlot {
-  id: string
-  name: string
-  savedAt: number
-  maps: GameMap[] // 저장 시점 맵(와이어)
-  activeMapId: string
-  bgm: BgmState[]
-  /** 저장 시점 통합 레이어 — 반면의 일부라 함께 복원(가져오기 배치 짝 유지). 구버전 슬롯엔 없음. */
-  globalTokens?: Token[]
-}
-/** 저장 슬롯 메타(목록 표시용 — 맵 본문 제외). 클라 protocol 과 미러. */
-export interface SaveSlotMeta {
-  id: string
-  name: string
-  savedAt: number
-}
-
-/** 비주얼 카드 — 이름·이미지·음향. 채팅 말미 타이틀 또는 수동으로 전원 화면에 오버레이 재생. 클라 protocol 과 미러. */
-export interface VisualCard {
-  id: string
-  name: string
-  image?: string // 없으면 음향만([NOIMAGE])
-  sound?: string
-  soundSec?: number // 음향 재생 길이(초 · 1~600) — 없으면 음원 끝까지
-  displaySec?: number // 카드 표시 시간(초 · 1~600) — 없으면 클릭할 때까지 표시
-  /**
-   * 이 카드를 쓸 화자들(보관대 키 = poolKey(playerId, charId)). 비었거나 없으면 누구의 발화에도 뜬다.
-   *
-   * ⚠ charId 만으로는 사람을 못 가린다 — 캐릭터를 장착하지 않은 발화의 charId 는 사람마다 값이 같은
-   *    'owner' 고정 문자열이다. 그래서 보관대와 같은 (사람, 캐릭터) 쌍을 열쇠로 쓴다.
-   */
-  for?: string[]
-}
-
-/** 카드를 고를 때 보는 발화자. 서버가 발화 시점에 각인한 값을 그대로 넘긴다(클라 전송값이 아니다). */
-export interface CardSpeaker {
-  playerId?: string
-  charId?: string
-}
-
-/** 세션방 목록 항목(room:list). 카드·메타만 — 장면/채팅 본문은 입장 시 스냅샷으로. 클라 protocol 과 미러. */
-export interface RoomSummary {
-  id: string
-  code: string
-  title: string
-  cardImage?: string
-  owner: boolean // 요청 계정이 소유자인지(삭제·복사·이름 변경은 소유자만)
-  gm?: boolean // 요청 계정이 이 방의 GM 인지(소유자 또는 공동 GM). 옛 서버는 안 보낸다
-  memberCount: number
-  online: number // 현재 접속 인원
-  updatedAt: number
-}
-
-// 코드 알파벳: 혼동 쉬운 문자(I, O, 0, 1) 제외.
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-
-function genSegment(): string {
-  let s = ''
-  for (let i = 0; i < 3; i++) s += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]
-  return s
-}
-
-function genCode(): string {
-  return `${genSegment()}-${genSegment()}-${genSegment()}`
-}
-
-const DEFAULT_GM_COLOR = '#e7a33e'
-const DEFAULT_PL_COLOR = '#7c9cff'
-const DEFAULT_GRID: GridConfig = { size: 64, visible: true }
-
-// ===== 레이어·z순서 =====
-/** 레이어 렌더 순서(작을수록 뒤). 와이어 토큰 정렬·신규 z 계산에 사용. */
-const LAYER_ORDER: Record<TokenLayer, number> = { behind: -1, bg: 0, token: 1, standing: 2 }
-/** 겹침 밴드 — 앞(위)→뒤(아래). 무대 이미지는 bg 와 behind 사이. 밴드 경계 넘는 앞으로/뒤로용(클라 미러). */
-const REORDER_BANDS: TokenLayer[] = ['standing', 'token', 'bg', 'behind']
-/** 알 수 없는 값은 token 레이어로 정규화. */
-function coerceLayer(v: unknown): TokenLayer {
-  return v === 'behind' || v === 'bg' || v === 'standing' ? v : 'token'
-}
-/** 해당 레이어에서 가장 앞(최대 z). 비었으면 0 → 다음 신규 토큰 z=1. */
-function topZ(tokens: Iterable<Token>, layer: TokenLayer): number {
-  let max = 0
-  for (const t of tokens) {
-    if ((t.layer ?? 'token') === layer && (t.z ?? 0) > max) max = t.z ?? 0
-  }
-  return max
-}
-
-// 외형 강제 — 허용값(렌더러 useUIStore 와 동일). 와이어 문자열을 서버가 이 목록으로 검증.
-const ACCENT_VALUES = ['indigo', 'teal', 'purple', 'amber', 'rose']
-const DICE_STYLE_VALUES = ['editorial', 'medallion', 'ticket', 'cjk', 'classic']
-const DEFAULT_APPEARANCE: Appearance = {
-  theme: 'dark',
-  accent: 'indigo',
-  uiAccent: '',
-  diceStyle: 'editorial'
-}
-
-/** 외형 페이로드 방어적 정규화(허용값 밖이면 기본값으로). uiAccent 는 hex 길이만 제한. */
-function normalizeAppearance(ap: Partial<Appearance> | undefined): Appearance {
-  return {
-    theme: ap?.theme === 'light' ? 'light' : 'dark',
-    accent: typeof ap?.accent === 'string' && ACCENT_VALUES.includes(ap.accent) ? ap.accent : 'indigo',
-    uiAccent: typeof ap?.uiAccent === 'string' ? ap.uiAccent.trim().slice(0, 32) : '',
-    diceStyle:
-      typeof ap?.diceStyle === 'string' && DICE_STYLE_VALUES.includes(ap.diceStyle)
-        ? ap.diceStyle
-        : 'editorial'
-  }
-}
-
-// BGM 음원 종류 허용값(렌더러 protocol BgmKind 와 동일).
-const BGM_KINDS = ['file', 'youtube']
-/** 동시 재생 BGM 트랙 최대 수(환경음+배경음 등 레이어드). */
-export const MAX_BGM_TRACKS = 5
-/** 볼륨 0~1 클램프(유한·기본값 처리). */
-function clampVol(v: unknown, fallback = 1): number {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : fallback
-}
-
-/**
- * BGM set 페이로드 방어적 정규화. 소스 없거나 kind 가 허용값 밖이면 null(무시).
- * title 은 200자 제한, loop 기본 true(앰비언트), volume 0~1(기본 1), playing 은 서버가 true 로 스탬프.
- */
-function normalizeBgm(
-  req:
-    | { trackId?: unknown; kind?: unknown; src?: unknown; title?: unknown; loop?: unknown; volume?: unknown }
-    | undefined
-): BgmState | null {
-  if (!req || typeof req.src !== 'string' || !req.src) return null
-  if (typeof req.kind !== 'string' || !BGM_KINDS.includes(req.kind)) return null
-  return {
-    trackId: typeof req.trackId === 'string' && req.trackId ? req.trackId : 'bgm',
-    kind: req.kind as BgmState['kind'],
-    src: req.src,
-    title: typeof req.title === 'string' ? req.title.slice(0, 200) : '',
-    loop: req.loop !== false,
-    playing: true,
-    volume: clampVol(req.volume)
-  }
-}
-
-// ===== 방 불러오기 방어적 정규화 — 신뢰할 수 없는 .orpg 페이로드를 안전한 서버 모델로. =====
-/** 이동 권한 playerId 목록 정규화 — 문자열만·각 캡·최대 64개. 빈/무효는 undefined. */
-function coercePlayerIds(v: unknown): string[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: string[] = []
-  for (const x of v) {
-    const id = capId(x)
-    if (id && !out.includes(id)) out.push(id)
-    if (out.length >= 64) break
-  }
-  return out.length ? out : undefined
-}
-/** 맵 텍스트 라벨 정규화 — 텍스트 200자·크기 8~200·색 캡. 무효면 null. */
-function coerceMapText(t: unknown): MapText | null {
-  if (!t || typeof t !== 'object') return null
-  const o = t as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id) return null
-  const text = typeof o.text === 'string' ? o.text.slice(0, 200) : ''
-  if (!text) return null
-  return {
-    id: o.id,
-    playerId: typeof o.playerId === 'string' ? o.playerId : '',
-    x: clampCoord(o.x),
-    y: clampCoord(o.y),
-    text,
-    color: typeof o.color === 'string' && o.color ? o.color.slice(0, 32) : '#ffffff',
-    size: typeof o.size === 'number' && Number.isFinite(o.size) ? Math.max(8, Math.min(200, o.size)) : 28,
-    bold: o.bold === true ? true : undefined
-  }
-}
-/** 토큰 공개범위 정규화 — 4종 외/부재는 undefined(=all). */
-function coerceVisibility(v: unknown): 'all' | 'owner' | 'private' | 'others' | undefined {
-  return v === 'all' || v === 'owner' || v === 'private' || v === 'others' ? v : undefined
-}
-/** visibility 값 → 저장 필드 쌍. all/undefined=필드 없음, private 은 레거시 hidden 미러(구클라 열화용). */
-function visFields(
-  v: 'all' | 'owner' | 'private' | 'others' | undefined
-): { visibility?: 'owner' | 'private' | 'others'; hidden?: true } {
-  const vis = v && v !== 'all' ? v : undefined
-  return { visibility: vis, hidden: vis === 'private' ? true : undefined }
-}
-/**
- * 이 계정이 그 방의 GM 인가 — 소유자이거나 공동 GM 으로 지정된 사람.
- *
- * 방 안의 권한은 참가자 레코드의 role 이 정하고, 그 role 은 입장할 때 이 함수로 정해진다.
- * 방 밖(입장 자격·잠금 통과·세션 목록)에서는 참가자 레코드가 없을 수 있어 이 함수를 직접 쓴다.
- */
-export function isGm(room: { ownerId: string; gmIds: Set<string> }, accountId: string | undefined): boolean {
-  return !!accountId && (room.ownerId === accountId || room.gmIds.has(accountId))
-}
-/** 토큰의 유효 공개범위 — visibility 우선, 레거시 hidden:true 는 private, 없으면 all. */
-export function tokenVisibility(t: { visibility?: string; hidden?: boolean }): 'all' | 'owner' | 'private' | 'others' {
-  return coerceVisibility(t.visibility) ?? (t.hidden ? 'private' : 'all')
-}
-/**
- * 뷰어가 토큰을 볼 수 있는지 — all=전원, private=GM만, owner=소유자+GM, others=소유자 외.
- * GM 은 미리보기로 항상 열람. viewer 없으면(내부/내보내기) 전부 열람.
- */
-export function canSeeToken(
-  t: { visibility?: string; hidden?: boolean; charPlayerId?: string },
-  viewer?: { playerId: string; role: Participant['role'] }
-): boolean {
-  if (!viewer) return true
-  const v = tokenVisibility(t)
-  if (v === 'all') return true
-  if (viewer.role === 'GM') return true
-  if (v === 'private') return false
-  if (v === 'owner') return t.charPlayerId === viewer.playerId
-  return t.charPlayerId !== viewer.playerId // 'others' — 소유자만 못 봄
-}
-/** 뷰어가 토큰 상태바·수치를 볼 수 있는지 — 상태 비공개면 소유자·GM(미리보기)만. */
-export function canSeeStats(
-  t: { statsPrivate?: boolean; charPlayerId?: string },
-  viewer?: { playerId: string; role: Participant['role'] }
-): boolean {
-  if (!t.statsPrivate || !viewer) return true
-  return viewer.role === 'GM' || t.charPlayerId === viewer.playerId
-}
-/**
- * 뷰어에게 보여줄 토큰 표현 — 앞면 가시=원본(단 상태 비공개면 상태바 제거), 아니면 backImage 있으면
- * 뒷면(앞면 민감정보 제거), 없으면 null(미표시). 양면 이미지·상태 비공개를 서버 권위로 구현.
- */
-export function tokenForViewer(
-  token: Token,
-  viewer?: { playerId: string; role: Participant['role'] }
-): Token | null {
-  if (canSeeToken(token, viewer)) {
-    // 앞면 보임 — 상태 비공개면 소유자·GM 외에는 커스텀 상태바를 서버가 제거(값 노출 차단).
-    if (token.bars?.length && !canSeeStats(token, viewer)) return { ...token, bars: undefined }
-    return token
-  }
-  if (!token.backImage) return null
-  // 뒷면 — 앞면 이미지·라벨·메모·이미지카드·소유자·클릭·색·이름/UI 등 민감 정보는 담지 않는다.
-  // 표시 맵 제한(mapIds)은 위치 정보라 유지 — 빠지면 뒷면만 보는 뷰어에게 전 맵 표시로 갈라진다.
-  return {
-    id: token.id,
-    x: token.x,
-    y: token.y,
-    size: token.size,
-    rotation: token.rotation,
-    layer: token.layer,
-    z: token.z,
-    flipX: token.flipX,
-    mapIds: token.mapIds,
-    image: token.backImage
-  }
-}
-/** 커스텀 상태바 정규화 — 최대 8개, 이름·현재/최대·색 캡. 빈 배열이면 undefined. */
-function coerceBars(v: unknown): TokenBar[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: TokenBar[] = []
-  for (const raw of v) {
-    if (out.length >= 8) break
-    if (!raw || typeof raw !== 'object') continue
-    const o = raw as Record<string, unknown>
-    const cur = typeof o.cur === 'number' && Number.isFinite(o.cur) ? o.cur : 0
-    const max = typeof o.max === 'number' && Number.isFinite(o.max) ? o.max : 0
-    out.push({
-      id: typeof o.id === 'string' && o.id ? o.id.slice(0, 40) : randomUUID(),
-      label: typeof o.label === 'string' ? o.label.slice(0, 24) || undefined : undefined,
-      cur: Math.max(-1_000_000, Math.min(1_000_000, cur)),
-      max: Math.max(0, Math.min(1_000_000, max)),
-      color: typeof o.color === 'string' ? o.color.slice(0, 16) || undefined : undefined,
-      link: o.link === 'hp' || o.link === 'mp' || o.link === 'san' ? o.link : undefined
+/** POST 본문을 바이너리 버퍼로 읽음(자산 업로드). maxBytes 초과 시 연결 끊고 null. */
+function readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    req.on('data', (c: Buffer) => {
+      total += c.length
+      if (total > maxBytes) {
+        req.destroy()
+        resolve(null)
+        return
+      }
+      chunks.push(c)
     })
-  }
-  return out.length ? out : undefined
-}
-/** 토큰 가로/세로 칸수(비정방 스트레치 비율) 정규화 — 0.25~캡(MAX_TOKEN_CELLS), 무효는 undefined. */
-function coerceSpanCells(v: unknown): number | undefined {
-  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return undefined
-  return Math.max(0.25, Math.min(MAX_TOKEN_CELLS, v))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', () => resolve(null))
+  })
 }
 
-/** 버튼 토큰 상태별 효과음(base/hover/press) 정규화 — 각 값은 문자열(asset ref/data URL)만·캡, 빈 값은 드롭.
- *  전부 비면 undefined(필드 자체 제거). */
-function coerceSounds(s: unknown): { base?: string; hover?: string; press?: string } | undefined {
-  if (!s || typeof s !== 'object') return undefined
-  const o = s as Record<string, unknown>
-  const pick = (v: unknown): string | undefined => (typeof v === 'string' && v ? capImage(v) : undefined)
-  const base = pick(o.base)
-  const hover = pick(o.hover)
-  const press = pick(o.press)
-  return base || hover || press ? { base, hover, press } : undefined
-}
-
-function coerceToken(t: unknown): Token | null {
-  if (!t || typeof t !== 'object') return null
-  const o = t as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id) return null
-  return {
-    id: o.id,
-    x: clampCoord(o.x),
-    y: clampCoord(o.y),
-    size:
-      typeof o.size === 'number' && Number.isFinite(o.size) && o.size > 0
-        ? Math.min(o.size, MAX_TOKEN_CELLS)
-        : 1,
-    // 비정방 스트레치 비율(가로·세로 칸) — 둘 다 있을 때만 의미(크기 자체는 size=긴 변).
-    w: coerceSpanCells(o.w),
-    h: coerceSpanCells(o.h),
-    rotation: typeof o.rotation === 'number' && Number.isFinite(o.rotation) ? o.rotation : undefined,
-    charPlayerId: capId(o.charPlayerId),
-    charId: capId(o.charId),
-    label: typeof o.label === 'string' ? o.label.slice(0, 200) : undefined,
-    color: typeof o.color === 'string' ? o.color.slice(0, 32) : undefined,
-    image: capImage(o.image),
-    layer: coerceLayer(o.layer),
-    z: typeof o.z === 'number' && Number.isFinite(o.z) ? o.z : 0,
-    flipX: o.flipX === true ? true : undefined,
-    hideName: o.hideName === true ? true : undefined,
-    hideUI: o.hideUI === true ? true : undefined,
-    allowedPlayers: coercePlayerIds(o.allowedPlayers),
-    // 이미지 카드 — 디스크 로드 시에도 보존(없으면 undefined). 최대 20장.
-    images: Array.isArray(o.images) ? capImageList(o.images, 20) : undefined,
-    currentIndex:
-      typeof o.currentIndex === 'number' && Number.isInteger(o.currentIndex) && o.currentIndex >= 0
-        ? o.currentIndex
-        : undefined,
-    // 패널 속성 — 디스크 로드 시 보존.
-    lockPos: o.lockPos === true ? true : undefined,
-    lockSize: o.lockSize === true ? true : undefined,
-    terrain: o.terrain === true ? true : undefined,
-    memo: typeof o.memo === 'string' ? o.memo.slice(0, 500) || undefined : undefined,
-    clickAction: typeof o.clickAction === 'string' ? o.clickAction.slice(0, 500) || undefined : undefined,
-    // 클릭 연출 카드 묶임 — 디스크 로드·방 불러오기에서도 보존(빠뜨리면 재시작마다 버튼이 풀린다).
-    clickCardId: typeof o.clickCardId === 'string' ? o.clickCardId.slice(0, 64) || undefined : undefined,
-    backImage: capImage(o.backImage),
-    bars: coerceBars(o.bars),
-    statsPrivate: o.statsPrivate === true ? true : undefined,
-    importId: capId(o.importId), // 가져오기 출처 태그(로드·가져오기 보존)
-    ownerPlayerId: capId(o.ownerPlayerId), // 참가자 창작 오브젝트 소유자(로드 보존 — 재시작해도 제 것만 만진다)
-    mapIds: coercePlayerIds(o.mapIds), // 표시 맵 제한(통합 레이어 · 로드·가져오기 보존)
-    liveStanding: o.liveStanding === true ? true : undefined, // 라이브 스탠딩 토큰(로스터 참조 렌더)
-    // 버튼 토큰 — hover/press 교체 이미지·상태별 효과음(디스크 로드 시 보존).
-    hoverImage: capImage(o.hoverImage),
-    pressImage: capImage(o.pressImage),
-    sounds: coerceSounds(o.sounds),
-    ...visFields(coerceVisibility(o.visibility) ?? (o.hidden === true ? 'private' : undefined))
-  }
-}
-function coerceStroke(s: unknown): Stroke | null {
-  if (!s || typeof s !== 'object') return null
-  const o = s as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id) return null
-  const pts: number[] = []
-  for (const v of Array.isArray(o.points) ? o.points : []) {
-    if (typeof v === 'number' && Number.isFinite(v)) pts.push(v)
-    if (pts.length >= 4000) break
-  }
-  if (pts.length % 2 !== 0) pts.pop()
-  if (pts.length < 2) return null
-  return {
-    id: o.id,
-    playerId: typeof o.playerId === 'string' ? o.playerId : '',
-    color: typeof o.color === 'string' ? o.color : '#ffffff',
-    width: typeof o.width === 'number' && Number.isFinite(o.width) ? Math.max(1, Math.min(40, o.width)) : 4,
-    points: pts
-  }
-}
-function coerceBackground(bg: unknown): MapBackground | null {
-  if (!bg || typeof bg !== 'object') return null
-  const o = bg as Record<string, unknown>
-  return {
-    image: capImage(o.image),
-    w: clampCoord(o.w),
-    h: clampCoord(o.h),
-    fit: o.fit === 'contain' || o.fit === 'cover' ? o.fit : undefined
-  }
-}
-/** 맵 바탕 정규화 — 이미지 캡·블러 0~40 클램프. 이미지 없으면 undefined(바탕 없음). */
-function coerceBackdrop(v: unknown): MapBackdrop | undefined {
-  if (!v || typeof v !== 'object') return undefined
-  const o = v as Record<string, unknown>
-  const image = capImage(o.image)
-  if (!image) return undefined
-  const blur =
-    typeof o.blur === 'number' && Number.isFinite(o.blur) ? Math.max(0, Math.min(40, o.blur)) : undefined
-  return blur ? { image, blur } : { image }
-}
-/** VN 레이어 배열 정규화 — 이미지 캡, 개수 상한(16), z/opacity/오프셋/배율 클램프. 무효/캡초과는 제외. 빈 결과는 undefined. */
-function coerceVnLayers(arr: unknown): VnLayer[] | undefined {
+/** 프레즌스 프로필 링크 방어적 정규화 — 라벨·URL 캡, http(s) 만 허용, 최대 6개. (계정 업데이트는 auth 가 별도 정규화) */
+function coerceProfileLinks(arr: unknown): ProfileLink[] | undefined {
   if (!Array.isArray(arr)) return undefined
-  // 오프셋(-100~100%)·배율(20~300%) — 편집 UI 슬라이더와 같은 범위(저장 가능 공간=편집 가능 공간).
-  // 기본값(0/100)은 저장하지 않아 와이어를 가볍게 유지.
-  const offset = (v: unknown): number | undefined => {
-    if (typeof v !== 'number' || !Number.isFinite(v)) return undefined
-    const n = Math.round(Math.max(-100, Math.min(100, v)))
-    return n === 0 ? undefined : n
-  }
-  const scaleOf = (v: unknown): number | undefined => {
-    if (typeof v !== 'number' || !Number.isFinite(v)) return undefined
-    const n = Math.round(Math.max(20, Math.min(300, v)))
-    return n === 100 ? undefined : n
-  }
-  const out: VnLayer[] = []
+  const out: ProfileLink[] = []
   for (const v of arr) {
     if (!v || typeof v !== 'object') continue
     const o = v as Record<string, unknown>
-    const image = capImage(o.image)
-    if (!image) continue // 이미지 없음 또는 캡 초과(드롭) → 레이어 아님
-    out.push({
-      id: typeof o.id === 'string' && o.id ? o.id.slice(0, 200) : randomUUID(),
-      image,
-      z: typeof o.z === 'number' && Number.isFinite(o.z) ? o.z : out.length,
-      opacity:
-        typeof o.opacity === 'number' && Number.isFinite(o.opacity)
-          ? Math.max(0, Math.min(1, o.opacity))
-          : undefined,
-      fit: o.fit === 'contain' ? 'contain' : o.fit === 'cover' ? 'cover' : undefined,
-      front: o.front === true ? true : undefined,
-      x: offset(o.x),
-      y: offset(o.y),
-      scale: scaleOf(o.scale)
-    })
-    if (out.length >= 16) break
+    const label = typeof o.label === 'string' ? o.label.trim().slice(0, 30) : ''
+    const url = typeof o.url === 'string' ? o.url.trim().slice(0, 400) : ''
+    if (!/^https?:\/\//i.test(url)) continue // http(s) 만(javascript: 등 차단)
+    out.push({ label: label || url, url })
+    if (out.length >= 6) break
   }
   return out.length ? out : undefined
 }
-/** VN 배경 흐림 강도 정규화 — 0~40, 0/무효는 undefined(없음). */
-function coerceVnBlur(v: unknown): number | undefined {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined
-  const n = Math.round(Math.max(0, Math.min(40, v)))
-  return n > 0 ? n : undefined
-}
-function coerceLoadedMap(gm: unknown): RoomMap | null {
-  if (!gm || typeof gm !== 'object') return null
-  const o = gm as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id) return null
-  // 맵당 오브젝트 개수 상한 — 디스크 로드·가져오기 등 모든 진입점 방어(수정 클라의 대량 emit 차단).
-  const tokens = new Map<string, Token>()
-  for (const t of Array.isArray(o.tokens) ? o.tokens : []) {
-    if (tokens.size >= MAX_TOKENS_PER_MAP) break
-    const c = coerceToken(t)
-    if (c) tokens.set(c.id, c)
-  }
-  const drawings = new Map<string, Stroke>()
-  for (const s of Array.isArray(o.drawings) ? o.drawings : []) {
-    if (drawings.size >= MAX_DRAWINGS_PER_MAP) break
-    const c = coerceStroke(s)
-    if (c) drawings.set(c.id, c)
-  }
-  const texts = new Map<string, MapText>()
-  for (const t of Array.isArray(o.texts) ? o.texts : []) {
-    if (texts.size >= MAX_TEXTS_PER_MAP) break
-    const c = coerceMapText(t)
-    if (c) texts.set(c.id, c)
-  }
-  const grid = o.grid && typeof o.grid === 'object' ? (o.grid as Record<string, unknown>) : {}
-  const size =
-    typeof grid.size === 'number' ? Math.round(Math.max(8, Math.min(512, grid.size))) : DEFAULT_GRID.size
-  return {
-    id: o.id,
-    name: typeof o.name === 'string' && o.name ? o.name : '맵',
-    background: coerceBackground(o.background),
-    grid: { size, visible: grid.visible !== false },
-    tokens,
-    drawings,
-    texts,
-    vnBackground: capImage(o.vnBackground),
-    vnBackgroundBlur: coerceVnBlur(o.vnBackgroundBlur),
-    vnLayers: coerceVnLayers(o.vnLayers),
-    bgColor: coerceDimColor(o.bgColor),
-    backdrop: coerceBackdrop(o.backdrop),
-    crossfade: o.crossfade === true ? true : undefined,
-    hiddenLayers: coerceHiddenLayers(o.hiddenLayers),
-    // 번들 BGM — 키가 있을 때만 정규화(없으면 undefined 유지=미저장). 최대 5·중복 제거는 coerceLoadedBgmList.
-    bgm: o.bgm !== undefined ? coerceLoadedBgmList(o.bgm) : undefined,
-    importId: capId(o.importId) // 가져오기 출처 태그(배치 연동 삭제용)
-  }
-}
-function coerceLoadedHandout(h: unknown): Handout | null {
-  if (!h || typeof h !== 'object') return null
-  const o = h as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id) return null
-  const scope: HandoutScope = o.scope === 'all' || o.scope === 'targeted' ? o.scope : 'private'
-  const now = Date.now()
-  return {
-    id: o.id,
-    title: typeof o.title === 'string' ? o.title.slice(0, 200) : '',
-    body: typeof o.body === 'string' ? o.body.slice(0, 20000) : '',
-    image: capImage(o.image),
-    imageAlign: o.imageAlign === 'center' || o.imageAlign === 'right' ? o.imageAlign : undefined,
-    folder: typeof o.folder === 'string' && o.folder ? o.folder.slice(0, 60) : undefined,
-    // 정렬 키가 없으면 없는 그대로 둔다 — 옛 데이터는 createdAt 폴백으로 생성순 유지.
-    sortKey: typeof o.sortKey === 'number' && Number.isFinite(o.sortKey) ? o.sortKey : undefined,
-    tags: Array.isArray(o.tags) ? o.tags.filter((t): t is string => typeof t === 'string').slice(0, 40) : [],
-    scope,
-    targets:
-      scope === 'targeted' && Array.isArray(o.targets)
-        ? o.targets.filter((t): t is string => typeof t === 'string')
-        : [],
-    createdAt: typeof o.createdAt === 'number' ? o.createdAt : now,
-    updatedAt: typeof o.updatedAt === 'number' ? o.updatedAt : now
-  }
-}
-/** 불러온 BGM 트랙 1개 정규화 — set 요청과 달리 저장된 playing 상태를 보존. 무효면 null. */
-function coerceLoadedBgm(b: unknown): BgmState | null {
-  if (!b || typeof b !== 'object') return null
-  const o = b as Record<string, unknown>
-  if (typeof o.src !== 'string' || !o.src) return null
-  if (typeof o.kind !== 'string' || !BGM_KINDS.includes(o.kind)) return null
-  return {
-    trackId: typeof o.trackId === 'string' && o.trackId ? o.trackId : 'bgm',
-    kind: o.kind as BgmState['kind'],
-    src: o.src,
-    title: typeof o.title === 'string' ? o.title.slice(0, 200) : '',
-    loop: o.loop !== false,
-    playing: o.playing === true,
-    volume: clampVol(o.volume)
-  }
-}
 
-/**
- * 불러온 BGM 트랙 목록 정규화. 배열이면 각 트랙 정규화(최대 5), 구버전 단일 객체면 배열로 마이그레이션,
- * null/없음이면 빈 배열. 중복 trackId 는 뒤엣것 우선.
- */
-function coerceLoadedBgmList(b: unknown): BgmState[] {
-  const raw = Array.isArray(b) ? b : b && typeof b === 'object' ? [b] : []
-  const out: BgmState[] = []
-  const seen = new Set<string>()
-  for (const item of raw) {
-    const t = coerceLoadedBgm(item)
-    if (!t) continue
-    if (seen.has(t.trackId)) {
-      out[out.findIndex((x) => x.trackId === t.trackId)] = t
-    } else if (out.length < MAX_BGM_TRACKS) {
-      seen.add(t.trackId)
-      out.push(t)
-    }
-  }
-  return out
-}
-
-/** ~문장~ 행동지문 색 정규화 — #rgb/#rrggbb hex 만 허용, 그 외/빈값이면 undefined(해제). */
-function coerceDimColor(v: unknown): string | undefined {
-  if (typeof v !== 'string' || !v) return undefined
-  const s = v.trim().toLowerCase()
-  return /^#[0-9a-f]{3}$/.test(s) || /^#[0-9a-f]{6}$/.test(s) ? s : undefined
-}
-
-/** 성공 단계별 연출 카드 키 — 와이어/디스크 무효 키 방어용 화이트리스트. */
-const CUTIN_LEVELS: SuccessLevel[] = ['critical', 'extreme', 'hard', 'regular', 'fail', 'fumble']
-
-/** 성공 단계별 연출 카드 맵 정규화 — 유효 단계 키 + 캡 이하 이미지만. 빈 맵이면 undefined. */
-function coerceCutInImages(v: unknown): Partial<Record<SuccessLevel, string>> | undefined {
-  if (!v || typeof v !== 'object') return undefined
-  const src = v as Record<string, unknown>
-  const out: Partial<Record<SuccessLevel, string>> = {}
-  for (const lv of CUTIN_LEVELS) {
-    const img = capImage(src[lv])
-    if (img) out[lv] = img
-  }
-  return Object.keys(out).length ? out : undefined
-}
-
-/** GM 커스텀 광기표 정규화 — realtime/summary 각 문자열 배열(최대 10개·각 500자). 둘 다 비면 undefined. */
-function coerceMadnessTables(v: unknown): MadnessTables | undefined {
+/** 프레즌스 프로필 색 테마 방어적 정규화 — 값은 hex 만(CSS 주입 방지). 전부 비면 undefined. */
+function coerceProfileTheme(v: unknown): ProfileTheme | undefined {
   if (!v || typeof v !== 'object') return undefined
   const o = v as Record<string, unknown>
-  // 항목 수 가변 — 40개·500자 캡. 빈 행은 보존(클라가 빈 표면 기본표 폴백).
-  const norm = (a: unknown): string[] =>
-    (Array.isArray(a) ? a : [])
-      .filter((s): s is string => typeof s === 'string')
-      .slice(0, 40)
-      .map((s) => s.slice(0, 500))
-  // 구버전 키(realtime 단일) → realtimeTemp 로 마이그레이션.
-  const realtimeTemp = norm(o.realtimeTemp ?? o.realtime)
-  const realtimeIndef = norm(o.realtimeIndef)
-  const summary = norm(o.summary)
-  if (realtimeTemp.length === 0 && realtimeIndef.length === 0 && summary.length === 0) return undefined
-  return { realtimeTemp, realtimeIndef, summary }
-}
-
-/** 인세인 커스텀 표 키(=룰셋 표 id 또는 GM 이 세션 중 추가한 새 표 id) 화이트리스트 — 와이어 위조로 임의 문자열이 객체 키로 들어오는 것 방지. */
-const INSANE_TABLE_KEY_RE = /^[A-Za-z0-9_가-힣]{1,64}$/
-/** GM 이 새 표에 지정하는 주사위 표기(예: 1d6, 2d10) 형식 검증. */
-const INSANE_TABLE_DICE_RE = /^\d{1,2}d\d{1,3}$/i
-
-/**
- * GM 커스텀 인세인 표 정규화 — 표 id(가변) → { label?, dice?, entries } 맵.
- * entries 만 있으면(label/dice 없음) 룰셋 표의 항목 덮어쓰기. label 까지 있으면 GM 이 세션 중 추가한 새 표.
- * 표 개수 최대 30개, 표당 항목 최대 40개·각 500자, label 최대 60자.
- * 모든 표의 entries 가 빈 배열이고 label 도 없으면 undefined(=완전 해제, 클라 기본 룰셋 표로 폴백).
- */
-function coerceInsaneTables(v: unknown): InsaneTables | undefined {
-  if (!v || typeof v !== 'object') return undefined
-  const o = v as Record<string, unknown>
-  const normEntries = (a: unknown): string[] =>
-    (Array.isArray(a) ? a : [])
-      .filter((s): s is string => typeof s === 'string')
-      .slice(0, 40)
-      .map((s) => s.slice(0, 500))
-  const out: InsaneTables = {}
-  let hasAny = false
-  for (const key of Object.keys(o).slice(0, 30)) {
-    if (!INSANE_TABLE_KEY_RE.test(key)) continue
-    const raw = o[key]
-    if (!raw || typeof raw !== 'object') continue
-    const r = raw as Record<string, unknown>
-    const entries = normEntries(r.entries)
-    const label =
-      typeof r.label === 'string' && r.label.trim() ? r.label.trim().slice(0, 60) : undefined
-    const dice =
-      typeof r.dice === 'string' && INSANE_TABLE_DICE_RE.test(r.dice.trim())
-        ? r.dice.trim().toLowerCase()
-        : undefined
-    if (entries.length === 0 && !label) continue
-    out[key] = { entries, ...(label ? { label } : {}), ...(dice ? { dice } : {}) }
-    hasAny = true
+  const hex = (x: unknown): string | undefined =>
+    typeof x === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(x) ? x : undefined
+  const t: ProfileTheme = {
+    accent: hex(o.accent),
+    nameColor: hex(o.nameColor),
+    bioColor: hex(o.bioColor),
+    bg: hex(o.bg)
   }
-  return hasAny ? out : undefined
+  return t.accent || t.nameColor || t.bioColor || t.bg ? t : undefined
 }
 
-/**
- * 채팅 두상 풀 분리 — 같은 두상이 여러 메시지에 반복되므로 풀(avatarPool)로 묶고 메시지는 avatarRef(인덱스)만 보관.
- * 디스크 저장·입장 스냅샷에서 사용(메시지 수 비례 두상 중복 폭증 방지). 런타임·증분(chat:new)은 avatar 인라인 유지.
- */
-function packAvatars(messages: ChatMessage[]): { messages: ChatMessage[]; avatarPool: string[] } {
-  const pool: string[] = []
-  const idx = new Map<string, number>()
-  const out = messages.map((m): ChatMessage => {
-    if (!m.avatar) return m
-    let i = idx.get(m.avatar)
-    if (i === undefined) {
-      i = pool.length
-      pool.push(m.avatar)
-      idx.set(m.avatar, i)
-    }
-    const copy: ChatMessage = { ...m, avatarRef: i }
-    delete copy.avatar
-    return copy
-  })
-  return { messages: out, avatarPool: pool }
-}
-
-/**
- * 이 메시지를 볼 수 있는 사람인지 — 귓속말·비밀 메시지는 당사자에게만 보인다.
- *   공개(main/ooc)      누구나
- *   귓속말(whisper)     보낸 사람 + 받는 사람만 (GM 도 제3자면 못 본다)
- *   비밀(secret)        보낸 사람 + GM 만
- *   그룹(group)         채널 접근권이 있는 사람만 — 판정은 호출 측(채널 멤버십)에 위임한다.
- * 히스토리에 저장은 하되 '보낼 때' 반드시 이 필터를 통과시킨다(클라 은닉을 믿지 않는다).
- */
-/**
- * 이 방의 채팅 두상이 자산 저장소에 어떤 이름으로 들어가 있는지 모아 준다(자산 GC 라이브 집합).
- *
- * 두상은 방에는 data URL 로 남고, 입장 스냅샷을 보낼 때만 자산으로 내부화된다. 그래서 'asset:' 문자열만
- * 훑는 수집기는 그 파일을 못 찾아 '아무도 안 쓴다'고 판정한다. 같은 두상이 수천 줄에 반복되므로
- * 문자열→해시 결과를 방 단위로 기억해 두 번 계산하지 않는다.
- */
-function collectAvatarHashes(room: Room, into: Set<string>): void {
-  const memo = new Map<string, string | null>()
-  for (const m of room.messages) {
-    const a = m.avatar
-    if (typeof a !== 'string' || !a.startsWith('data:')) continue
-    let h = memo.get(a)
-    if (h === undefined) {
-      h = dataUrlHash(a)
-      memo.set(a, h)
-    }
-    if (h) into.add(h)
-  }
-}
-
-export function canSeeMessage(
-  m: ChatMessage,
-  viewer: { playerId: string; role: Participant['role'] },
-  canAccessGroup?: (groupId: string) => boolean
-): boolean {
-  if (m.secret) return m.playerId === viewer.playerId || viewer.role === 'GM'
-  // 귓속말은 주고받은 두 사람만. 단 발화 당시 방이 GM 열람을 켜 두었다면(각인) GM 도 본다 —
-  // 지금의 방 설정이 아니라 각인을 보므로, 설정을 켠다고 지난 귓속말이 소급해서 열리지 않는다.
-  if (m.channel === 'whisper')
-    return (
-      m.playerId === viewer.playerId ||
-      m.to === viewer.playerId ||
-      (m.gmVisible === true && viewer.role === 'GM')
-    )
-  if (m.channel === 'group' && m.groupId) return canAccessGroup ? canAccessGroup(m.groupId) : false
-  return true
-}
-
-/** packAvatars 역연산 — avatarRef 를 풀에서 찾아 avatar 인라인으로 복원(런타임 메시지로). */
-function unpackAvatars(messages: ChatMessage[], pool: string[]): ChatMessage[] {
-  return messages.map((m): ChatMessage => {
-    if (typeof m.avatarRef !== 'number') return m
-    const copy: ChatMessage = { ...m }
-    const avatar = pool[m.avatarRef]
-    delete copy.avatarRef
-    if (avatar) copy.avatar = avatar
-    return copy
+/** POST 본문을 JSON 으로 파싱(최대 3MB — 프로필 아바타+배너 이미지 수용). 실패 시 빈 객체. */
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let body = ''
+    req.on('data', (c: Buffer) => {
+      body += c
+      if (body.length > 3_000_000) req.destroy()
+    })
+    req.on('end', () => {
+      try {
+        // JSON.parse('null')→null, '[...]'→배열, '5'→숫자 — 객체가 아닌 본문을 그대로 주면 핸들러의
+        //   body.x 접근이 throw 하므로, 객체가 아니면 빈 객체로 강제.
+        const parsed = JSON.parse(body || '{}')
+        resolve(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {})
+      } catch {
+        resolve({})
+      }
+    })
+    req.on('error', () => resolve({}))
   })
 }
 
-/** 새 빈 맵 생성(서버 내부). */
-function makeMap(name: string): RoomMap {
-  return {
-    id: randomUUID(),
-    name,
-    background: null,
-    grid: { ...DEFAULT_GRID },
-    tokens: new Map(),
-    drawings: new Map(),
-    texts: new Map()
-  }
-}
-/** 서버 내부 RoomMap → 와이어 GameMap(토큰·드로잉·텍스트 배열화). */
-function toWireMap(m: RoomMap): GameMap {
-  return {
-    id: m.id,
-    name: m.name,
-    background: m.background,
-    grid: m.grid,
-    tokens: [...m.tokens.values()].sort(
-      (a, b) => LAYER_ORDER[a.layer ?? 'token'] - LAYER_ORDER[b.layer ?? 'token'] || (a.z ?? 0) - (b.z ?? 0)
-    ),
-    drawings: [...m.drawings.values()],
-    texts: [...m.texts.values()],
-    vnBackground: m.vnBackground,
-    vnBackgroundBlur: m.vnBackgroundBlur,
-    vnLayers: m.vnLayers,
-    bgColor: m.bgColor,
-    backdrop: m.backdrop,
-    crossfade: m.crossfade,
-    hiddenLayers: m.hiddenLayers,
-    bgm: m.bgm,
-    importId: m.importId
-  }
-}
+/** 서버 데이터 내보내기 상한(원시 바이트) — 초과 시 거부하고 data/ 폴더 직접 복사를 안내(인메모리 번들 메모리 보호). */
+const SERVER_EXPORT_MAX_BYTES = 100 * 1024 * 1024
+/** 멤버 본인 데이터(게시글·세션방·참조 자산) 내보내기 상한 — 인메모리 base64 번들 메모리 보호. */
+const MEMBER_EXPORT_MAX_BYTES = 80 * 1024 * 1024
 
-/** 핸드아웃 가시성(서버 권위). GM=전부 / private=GM만 / all=전체 / targeted=대상만. */
-export function canViewHandout(h: Handout, viewer: { playerId: string; role: Participant['role'] }): boolean {
-  if (viewer.role === 'GM') return true
-  if (h.scope === 'private') return false
-  if (h.scope === 'all') return true
-  return h.targets.includes(viewer.playerId)
-}
-
-/** 저장 슬롯 배열 정규화(로드용) — 최대 3, 맵 재정규화(coerceLoadedMap→toWireMap), 무효/빈 맵 슬롯 제외. 빈 결과=undefined. */
-function coerceSaveSlots(v: unknown): SaveSlot[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: SaveSlot[] = []
-  for (const s of v) {
-    if (out.length >= 3) break
-    if (!s || typeof s !== 'object') continue
-    const o = s as Record<string, unknown>
-    const maps: GameMap[] = []
-    for (const g of Array.isArray(o.maps) ? o.maps : []) {
-      const m = coerceLoadedMap(g)
-      if (m) maps.push(toWireMap(m))
-    }
-    if (!maps.length) continue // 맵 없는 슬롯은 복원 불가 → 제외
-    const activeMapId =
-      typeof o.activeMapId === 'string' && maps.some((m) => m.id === o.activeMapId)
-        ? o.activeMapId
-        : maps[0].id
-    out.push({
-      id: typeof o.id === 'string' && o.id ? o.id.slice(0, 60) : randomUUID(),
-      name: (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 60) || `저장 ${out.length + 1}`,
-      savedAt: typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : Date.now(),
-      maps,
-      activeMapId,
-      bgm: coerceLoadedBgmList(o.bgm),
-      // 통합 레이어 스냅샷 — 키 있을 때만(구버전 슬롯은 undefined 유지 → 로드 시 현재 것 보존).
-      globalTokens:
-        o.globalTokens !== undefined
-          ? [...(coerceGlobalTokens(o.globalTokens)?.values() ?? [])]
-          : undefined
-    })
-  }
-  return out.length ? out : undefined
-}
-
-/** 카드 음향 재생 길이(초) 정규화 — 음향 있을 때만 1~600 정수, 그 외 undefined(음원 끝까지). */
-function coerceSoundSec(v: unknown, sound: string | undefined): number | undefined {
-  if (!sound || typeof v !== 'number' || !Number.isFinite(v)) return undefined
-  const n = Math.round(v)
-  return n >= 1 ? Math.min(n, 600) : undefined
-}
-/** 숨긴 레이어 목록 정규화 — 알려진 밴드(REORDER_BANDS)만·중복 제거. 빈 결과=undefined(전부 표시). */
-function coerceHiddenLayers(v: unknown): TokenLayer[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: TokenLayer[] = []
-  for (const x of v) {
-    if (REORDER_BANDS.includes(x as TokenLayer) && !out.includes(x as TokenLayer)) out.push(x as TokenLayer)
-  }
-  return out.length ? out : undefined
-}
-/** 카드 표시 시간(초) 정규화 — 이미지 있을 때만 1~600 정수, 그 외 undefined(클릭할 때까지 표시). */
-function coerceDisplaySec(v: unknown, image: string | undefined): number | undefined {
-  if (!image || typeof v !== 'number' || !Number.isFinite(v)) return undefined
-  const n = Math.round(v)
-  return n >= 1 ? Math.min(n, 600) : undefined
-}
-
-// 채팅 꾸미기 마크업 벗기기 — 카드 키워드 매칭을 '화면에 보이는 평문' 기준으로 하기 위한 미러.
-// 문법·태그 목록은 렌더러 lib/chat/markup.ts 와 동일해야 한다: [a-z] 태그만 마크업이고,
-// 모르는 태그([대성공]·[HIT] 같은 비 화이트리스트 대괄호)는 클라가 글자 그대로 보여주므로 여기서도 남긴다.
-const MARKUP_TAG_RE = /\[(\/?)([a-z]+)(?:=[^\]]*)?\]/g
-const MARKUP_TAGS = new Set([
-  'b', 'i', 'u', 's', 'color', 'bg', 'size', 'ruby', 'center', 'right', 'left',
-  'box', 'bubble', 'bar', 'img', 'dim', 'roll', 'css'
-])
-/** 보이드 태그 — 그 자리에 별도 객체(이미지·굴림 숫자·막대)가 렌더되므로 공백으로 치환해,
- *  앞뒤 글자가 이어붙어 화면에 없는 단어가 생기는 오발동을 막는다. 감싸기 태그는 표시 폭이 없어 제거. */
-const MARKUP_VOID = new Set(['bar', 'img', 'roll'])
-function stripChatMarkup(src: string): string {
-  return (
-    src
-      .replace(MARKUP_TAG_RE, (raw, _closing, name) =>
-        MARKUP_TAGS.has(name) ? (MARKUP_VOID.has(name) ? ' ' : '') : raw
-      )
-      // 인라인 강조(*기울임*·**굵게**)의 별표는 렌더에서 사라지므로 매칭에서도 제거 — "*대성공*" 강조 발동.
-      .replace(/\*/g, '')
-  )
-}
-
-/** 덱 카드 정의 정규화 — 이름 필수(60캡)·설명 300캡·장수 1~99·그림 용량 캡. */
-function coerceDeckCards(v: unknown): DeckCard[] {
-  if (!Array.isArray(v)) return []
-  const out: DeckCard[] = []
-  let total = 0
-  for (const c of v) {
-    if (out.length >= MAX_DECK_CARDS || total >= MAX_DECK_TOTAL) break
-    if (!c || typeof c !== 'object') continue
-    const o = c as Record<string, unknown>
-    const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 60)
-    if (!name) continue
-    const text = (typeof o.text === 'string' ? o.text.trim() : '').slice(0, 300)
-    const raw = typeof o.count === 'number' && Number.isFinite(o.count) ? Math.round(o.count) : 1
-    // 총 장수 상한에 걸리면 남은 자리만큼만 넣는다 — 통째로 버리면 카드가 조용히 사라진다.
-    const count = Math.max(1, Math.min(MAX_DECK_CARD_COUNT, raw, MAX_DECK_TOTAL - total))
-    total += count
-    const card: DeckCard = { id: capId(o.id) || randomUUID(), name }
-    const image = capImage(o.image)
-    if (image) card.image = image
-    if (text) card.text = text
-    if (count > 1) card.count = count
-    out.push(card)
-  }
-  return out
-}
-
-/** 카드 정의를 장수만큼 늘어놓는다 — 섞기 전의 한 벌. */
-function deckPile(cards: DeckCard[]): string[] {
+/** dir 이하 모든 파일의 절대경로를 재귀 수집(없는 디렉터리·접근 불가는 건너뜀). 서버 데이터 백업용. */
+function listFilesRec(root: string): string[] {
   const out: string[] = []
-  for (const c of cards) for (let i = 0; i < Math.max(1, c.count ?? 1); i++) out.push(c.id)
+  const walk = (dir: string): void => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name)
+      if (e.isDirectory()) walk(full)
+      else if (e.isFile()) out.push(full)
+    }
+  }
+  walk(root)
   return out
 }
 
-/** 제자리 섞기(피셔-예이츠). 뽑기는 배열 뒤에서 꺼내므로 앞뒤 치우침 없이 고르게 섞여야 한다. */
-function shufflePile(pile: string[]): string[] {
-  for (let i = pile.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[pile[i], pile[j]] = [pile[j], pile[i]]
-  }
-  return pile
-}
-
-/** 덱의 총 장수(count 합) — 남은 장수와 함께 '몇 장 중 몇 장'을 보여 주는 데 쓴다. */
-function deckTotal(d: Deck): number {
-  let n = 0
-  for (const c of d.cards) n += Math.max(1, c.count ?? 1)
-  return n
+/** 가져오기 상대경로 안전성 — 빈 값·절대경로·상위(..) 탈출 차단. dataDir 안에만 기록하도록. */
+function isSafeRelPath(rel: string): boolean {
+  if (!rel || rel.startsWith('/') || rel.startsWith('\\') || /^[a-zA-Z]:/.test(rel)) return false
+  return !rel.split(/[/\\]/).some((seg) => seg === '..' || seg === '')
 }
 
 /**
- * 덱 → 참가자에게 내보낼 공개본.
- * 남은 더미의 순서는 절대 싣지 않는다 — 실으면 다음에 나올 카드가 그대로 보인다.
- * 카드 목록을 감춘 덱은 GM 에게만 정의를 보인다(무엇이 들었는지가 놀이의 일부일 수 있다).
+ * 발화 정체성 프레즌스의 현재 표정 두상 — headshots[currentExpression] 우선, 없으면 단일 headshot.
+ * 서버가 메시지에 각인해 두면 서버 재시작·새 참가자에게도 채팅 두상이 그대로 보존된다(라이브 roster 조회 불필요).
  */
-function deckView(d: Deck, viewer?: { role: Participant['role']; playerId?: string }): DeckView {
-  const hide = !d.revealCards && viewer?.role !== 'GM'
-  // '비밀로' 뽑은 카드는 뽑은 사람과 GM 에게만. 남은 장수는 모두에게 알린다(그것까지 감추면 판이 어긋난다).
-  const seen = (e: { id: string; by?: string }): boolean =>
-    !e.by || viewer?.role === 'GM' || e.by === viewer?.playerId
-  return {
-    id: d.id,
-    name: d.name,
-    cards: hide ? [] : d.cards,
-    remaining: d.draw.length,
-    total: deckTotal(d),
-    discard: hide ? [] : d.discard.filter(seen).map((e) => e.id),
-    announce: d.announce,
-    reshuffle: d.reshuffle,
-    revealCards: d.revealCards,
-    who: d.who,
-    createdAt: d.createdAt
-  }
-}
-
-/** 덱 배열 정규화(로드용) — 최대 MAX_DECKS, 이름 필수·40캡. 남은 더미는 정의에 없는 id 를 걷어낸다. */
-function coerceDecks(v: unknown): Deck[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: Deck[] = []
-  for (const raw of v) {
-    if (out.length >= MAX_DECKS) break
-    if (!raw || typeof raw !== 'object') continue
-    const o = raw as Record<string, unknown>
-    const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 40)
-    if (!name) continue
-    const cards = coerceDeckCards(o.cards)
-    const ids = new Set(cards.map((c) => c.id))
-    /** 저장본의 더미에서 지금 정의에 있는 카드만 남긴다 — 정의가 바뀐 뒤 되살릴 때 유령 카드를 막는다. */
-    const keep = (x: unknown): string[] =>
-      (Array.isArray(x) ? x : []).filter((id): id is string => typeof id === 'string' && ids.has(id)).slice(0, MAX_DECK_TOTAL)
-    out.push({
-      id: capId(o.id) || randomUUID(),
-      name,
-      cards,
-      // draw 가 아예 없는 파일(내보내기본)은 한 벌을 새로 섞는다. 빈 배열은 '다 뽑았다'는 뜻이라 그대로 둔다.
-      draw: Array.isArray(o.draw) ? keep(o.draw) : shufflePile(deckPile(cards)),
-      // 버린 더미는 옛 저장본에서 문자열 배열로 온다 — 그때는 공개 뽑기로 본다.
-      discard: (Array.isArray(o.discard) ? o.discard : [])
-        .map((e) => (typeof e === 'string' ? { id: e } : (e as { id?: unknown; by?: unknown })))
-        .filter((e): e is { id: string; by?: string } => typeof e?.id === 'string' && ids.has(e.id))
-        .map((e) => (typeof e.by === 'string' ? { id: e.id, by: e.by } : { id: e.id }))
-        .slice(0, MAX_DECK_TOTAL),
-      announce: o.announce !== false,
-      reshuffle: o.reshuffle === true,
-      revealCards: o.revealCards !== false,
-      who: o.who === 'gm' ? 'gm' : 'all',
-      createdAt: typeof o.createdAt === 'number' ? o.createdAt : Date.now()
-    })
-  }
-  return out.length ? out : undefined
+function presenceHeadshot(
+  ch: { headshot?: string; headshots?: string[]; currentExpression?: number } | undefined
+): string | undefined {
+  if (!ch) return undefined
+  const i = ch.currentExpression ?? 0
+  return ch.headshots?.[i] || ch.headshot
 }
 
 /**
- * 카드 화자 목록 정규화 — 문자열 열쇠만, 중복 제거, 개수·길이 캡. 빈 결과=undefined(전원 공용).
+ * 비주얼 카드를 고를 때 쓸 화자 — 방금 서버가 각인한 메시지에서 그대로 뽑는다.
  *
- * ⚠ 이 함수를 지나는 자리가 둘이다(와이어 진입 setVisualCard, 디스크 로드 coerceVisualCards).
- *    한쪽만 태우면 '설정 직후엔 되는데 서버를 다시 켜면 전원에게 뜬다'가 된다 — 제한이 풀리는
- *    방향이라 눈에 잘 안 띄고, 감춰 둔 연출이 새어 나가는 쪽으로 어긋난다.
+ * GM 의 1회성 NPC 발화에는 charId 가 없다(npc 표시만 붙는다). 그런 발화는 어떤 화자에도 매이지
+ * 않으므로 공용 카드만 뜬다 — 없는 값을 지어내 아무 화자나 흉내 내게 하지 않는다.
  */
-function coerceCardSpeakers(v: unknown): string[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: string[] = []
-  for (const k of v) {
-    if (out.length >= MAX_CARD_SPEAKERS) break
-    if (typeof k !== 'string') continue
-    const key = k.trim()
-    // ⚠ 긴 열쇠는 자르지 않고 버린다. 잘라 두면 그 열쇠는 어떤 화자와도 안 맞아, 카드가 '아무에게도
-    //    안 뜨는' 상태로 조용히 남는다. 정상 열쇠는 (사람 id + 캐릭터 id) 라 여든 자를 넘지 않는다.
-    if (!key || key.length > 200 || out.includes(key)) continue
-    out.push(key)
-  }
-  return out.length ? out : undefined
+function cardSpeakerOf(m: { playerId?: string; charId?: string }): CardSpeaker {
+  return { playerId: m.playerId, charId: m.charId }
 }
 
-/** 비주얼 카드 배열 정규화(로드용) — 개수 상한, 이름 필수·40캡, 이미지/음향 캡·둘 다 없으면 제외. 빈 결과=undefined. */
-function coerceVisualCards(v: unknown): VisualCard[] | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: VisualCard[] = []
-  for (const c of v) {
-    if (out.length >= MAX_VISUAL_CARDS) break
-    if (!c || typeof c !== 'object') continue
-    const o = c as Record<string, unknown>
-    const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 40)
-    if (!name) continue
-    const image = capImage(o.image)
-    const sound = capImage(o.sound)
-    if (!image && !sound) continue // 이미지·음향 둘 다 없음 → 카드 아님
-    out.push({
-      id: typeof o.id === 'string' && o.id ? o.id.slice(0, 60) : randomUUID(),
-      name,
-      image,
-      sound,
-      soundSec: coerceSoundSec(o.soundSec, sound),
-      displaySec: coerceDisplaySec(o.displaySec, image),
-      for: coerceCardSpeakers(o.for)
-    })
-  }
-  return out.length ? out : undefined
-}
+/** 토큰 클릭 연출(card:trigger)의 카드별 최근 재생 시각 — 연타가 방 전체 오버레이를 도배하지 않게. */
+const cardTriggerAt = new Map<string, number>()
+const CARD_TRIGGER_COOLDOWN_MS = 2000
 
-/** 통합 레이어 토큰 정규화(로드용) — 배열→Map, coerceToken·개수 상한. 빈 결과=undefined. */
-function coerceGlobalTokens(v: unknown): Map<string, Token> | undefined {
-  if (!Array.isArray(v)) return undefined
-  const tokens = new Map<string, Token>()
-  for (const t of v) {
-    if (tokens.size >= MAX_TOKENS_PER_MAP) break
-    const c = coerceToken(t)
-    if (c) tokens.set(c.id, c)
-  }
-  return tokens.size ? tokens : undefined
+/**
+ * 비밀 메시지(비밀 굴림·비밀 발화) 수신 대상 개인 룸 — 보낸 사람 + 그 방의 모든 GM.
+ * rooms.canSeeMessage(히스토리 열람 규칙)와 같은 집합이어야 한다 — 어긋나면 재입장 뒤에야 보이는 메시지가 생긴다.
+ */
+function secretTargets(room: Room, senderId: string): string[] {
+  const targets = new Set<string>(['user:' + senderId])
+  for (const p of room.participants.values()) if (p.role === 'GM') targets.add('user:' + p.playerId)
+  return [...targets]
 }
 
 /**
- * 보관대에 담을 몫만 남긴다.
+ * 귓속말 수신 대상 개인 룸 — 주고받는 두 사람 + (그 말에 GM 열람이 각인돼 있으면) 그 방의 모든 GM.
  *
- * 보관대는 방 파일에 저장되고 입장할 때 전원에게 전달되므로, **토큰이 그리는 데 쓰는 것만** 담는다.
- * 배너(계정 배너 · 1.2MB 캡)와 표정별 두상 묶음(최대 24장)은 토큰과 무관한데, 그냥 복사하면 사람×캐릭터
- * 조합만큼 중복돼 방 파일과 입장 전송이 수십 MB 로 부푼다.
+ * 지금의 방 설정이 아니라 메시지에 찍힌 각인(gmVisible)을 본다. 설정을 켠 뒤에 오간 말만 GM 에게
+ * 열리고, 나중에 설정을 꺼도 이미 GM 이 본 말의 수정·삭제는 그대로 따라가야 하기 때문이다.
+ * rooms.canSeeMessage(히스토리 열람 규칙)와 같은 집합이어야 한다.
  */
-function poolSubset(c: SharedCharacter): SharedCharacter {
-  return {
-    playerId: c.playerId,
-    charId: c.charId,
-    name: c.name,
-    color: c.color,
-    nameColor: c.nameColor,
-    headshot: c.headshot, // 원형 토큰 그림
-    headshots: c.headshots, // 표정별 두상 — 보관대 화자의 채팅 두상 각인이 표정을 따라가게 함께 담는다
-    standings: c.standings, // 스탠딩 토큰(자산 참조라 가볍다)
-    currentExpression: c.currentExpression,
-    standingHeight: c.standingHeight,
-    stats: c.stats, // 토큰 위 HP/MP/SAN 바
-    visibility: c.visibility
-  }
-}
-
-/** 파일에서 읽은 보관대 — 형태를 깎고 상한까지 적용해 되살린다. */
-function loadCharPool(v: unknown): Map<string, SharedCharacter> {
-  const out = new Map<string, SharedCharacter>()
-  if (!Array.isArray(v)) return out
-  for (const raw of v) {
-    if (out.size >= MAX_CHAR_POOL) break
-    const c = raw as SharedCharacter | null
-    const key = poolKey(c?.playerId, c?.charId)
-    if (!key || !c) continue
-    out.set(key, poolSubset({
-      ...c,
-      name: typeof c.name === 'string' ? c.name.slice(0, 100) : '',
-      color: typeof c.color === 'string' ? c.color.slice(0, 32) : '#7c9cff',
-      headshot: capImage(c.headshot),
-      headshots: c.headshots ? capImageList(c.headshots) : undefined,
-      standings: capImageList(c.standings)
-    }))
-  }
-  return out
-}
-
-/** 보관대 상한 적용 — 넘치면 오래 안 쓴 앞자리부터 덜어 낸다. */
-function trimCharPool(room: Room): void {
-  if (room.charPool.size <= MAX_CHAR_POOL) return
-  const drop = room.charPool.size - MAX_CHAR_POOL
-  let n = 0
-  for (const k of [...room.charPool.keys()]) {
-    if (n++ >= drop) break
-    room.charPool.delete(k)
-  }
+function whisperTargets(room: Room, m: { playerId?: string; to?: string; gmVisible?: boolean }): string[] {
+  const targets = new Set<string>()
+  for (const id of [m.playerId, m.to]) if (id) targets.add('user:' + id)
+  if (m.gmVisible)
+    for (const p of room.participants.values()) if (p.role === 'GM') targets.add('user:' + p.playerId)
+  return [...targets]
 }
 
 /**
- * 캐릭터 보관대 색인 키 — 사람과 캐릭터를 함께 잡는다. 둘 중 하나라도 비면 담지 않는다.
- * 앞자리 길이를 붙여 잇는 이유: 구분자 한 글자로 이으면 그 글자가 id 안에 섞였을 때
- * 다른 조합이 같은 키가 되어 남의 캐릭터를 가리키게 된다.
+ * 이 메시지의 전달 대상 — 비공개(귓속말·비밀)면 당사자들의 개인 룸, 공개면 방 전체(roomId).
+ * 수정·삭제 브로드캐스트가 원문과 같은 사람에게만 가도록 발화 시점의 라우팅을 그대로 재현한다.
  */
-function poolKey(playerId: string | undefined, charId: string | undefined): string {
-  return playerId && charId ? playerId.length + ':' + playerId + charId : ''
+function messageAudience(
+  room: Room,
+  m: {
+    playerId?: string
+    to?: string
+    channel: string
+    secret?: boolean
+    groupId?: string
+    gmVisible?: boolean
+  }
+): string[] {
+  if (m.secret) return secretTargets(room, m.playerId ?? '')
+  if (m.channel === 'whisper') return whisperTargets(room, m)
+  if (m.channel === 'group' && m.groupId) {
+    // 그룹 채널: 그 그룹의 멤버 + GM 에게만. 여기서 방 전체로 내보내면 수정·삭제 방송에 본문이 실려
+    // 그룹에 없는 사람에게 대화가 새어 나간다. 채널이 이미 지워졌으면 보낼 곳이 없다.
+    const ch = room.channels.get(m.groupId)
+    if (!ch) return []
+    const ids = new Set(ch.members)
+    for (const [pid, p] of room.participants) if (p.role === 'GM') ids.add(pid)
+    return [...ids].map((id) => 'user:' + id)
+  }
+  return [room.id]
 }
 
-/** 방 → 영속 파일(JSON). 장면·메타·멤버·전체 채팅. 참가자/프레즌스는 런타임이라 제외. */
-function roomToFile(room: Room): Record<string, unknown> {
-  const { messages, avatarPool } = packAvatars(room.messages) // 채팅 두상 풀 분리 — 파일 크기 절감
-  return {
-    id: room.id,
-    code: room.code,
-    title: room.title,
-    ownerId: room.ownerId,
-    gmIds: [...room.gmIds],
-    members: [...room.members],
-    // 세션 멤버 명단(playerId 기준 · 이미지 없는 경량) — 재시작에도 '한번 접속한 멤버'를 권한 대상으로 유지.
-    // connected 는 런타임 상태라 저장 안 함(로드 시 전부 오프라인 → 재접속하면 admit 이 갱신).
-    participantList: [...room.participants.values()].map((p) => ({
-      playerId: p.playerId,
-      nick: p.nick,
-      color: p.color,
-      role: p.role
-    })),
-    cardImage: room.cardImage,
-    maps: [...room.maps.values()].map(toWireMap),
-    activeMapId: room.activeMapId,
-    handouts: [...room.handouts.values()],
-    appearance: room.appearance,
-    cutInImage: room.cutInImage,
-    cutInImages: room.cutInImages,
-    dimColor: room.dimColor,
-    madnessTables: room.madnessTables, // GM 커스텀 광기표
-    insaneTables: room.insaneTables, // GM 커스텀 인세인 표
-    luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
-    locked: room.locked, // 입실 잠금(공사중)
-    vnOverlay: room.vnOverlay, // 일반 맵 VN 오버레이 표시 여부
-    plObjects: room.plObjects, // 참가자 오브젝트 추가 허용 여부
-    gmSeeWhispers: room.gmSeeWhispers, // GM 귓속말 열람 여부
-    bgm: room.bgm,
-    channels: [...room.channels.values()],
-    // 캐릭터 보관대 — 맵 토큰이 charId 로 참조하므로 재시작 뒤에도 있어야 토큰이 이름·수치를 되찾는다.
-    charPool: [...room.charPool.values()],
-    messages,
-    avatarPool, // 채팅 두상 풀
-    charRooms: Object.fromEntries(room.charRooms), // 방별 시트 멤버십
-    saveSlots: room.saveSlots ?? [], // 저장 슬롯(반면 전체 명명 저장 · 최대 3)
-    visualCards: room.visualCards ?? [], // 비주얼 카드 — 이미지/음향
-    decks: room.decks, // 덱 — 남은 더미까지(재시작해도 진행 중인 판이 이어지게)
-    globalTokens: room.globalTokens ? [...room.globalTokens.values()] : [], // 통합 레이어 토큰
-    // GM 선택지 — 재시작 뒤에도 화면에 남은 선택지 카드가 계속 눌리게(옵션 스크립트는 여기에만 있다).
-    choices: room.choices
-      ? [...room.choices].map(([mid, c]) => ({
-          mid,
-          options: c.options,
-          // 누가 무엇을 골랐는지까지 남긴다 — 고른 사람만 알면 재입장한 화면이 '무엇을 골랐는지' 못 되살린다.
-          responders: [...c.responders].map(([pid, oid]) => [pid, oid])
-        }))
-      : [],
-    createdAt: room.createdAt,
-    lastActivityAt: room.lastActivityAt
-  }
-}
-
-/** 영속 파일 → 방(방어적 정규화). 참가자/프레즌스는 빈 상태(재입장 시 재구성). */
-function roomFromFile(data: unknown): Room | null {
-  if (!data || typeof data !== 'object') return null
-  const o = data as Record<string, unknown>
-  if (typeof o.id !== 'string' || !o.id || typeof o.code !== 'string' || !o.code) return null
-  const maps = new Map<string, RoomMap>()
-  for (const gm of Array.isArray(o.maps) ? o.maps : []) {
-    const m = coerceLoadedMap(gm)
-    if (m) maps.set(m.id, m)
-  }
-  if (maps.size === 0) {
-    const m = makeMap('맵 1')
-    maps.set(m.id, m)
-  }
-  const handouts = new Map<string, Handout>()
-  for (const h of Array.isArray(o.handouts) ? o.handouts : []) {
-    const c = coerceLoadedHandout(h)
-    if (c) handouts.set(c.id, c)
-  }
-  // 채팅 두상 풀 복원 — avatarRef 를 풀에서 avatar 인라인으로 되돌림(런타임 메시지).
-  const avatarPool = Array.isArray(o.avatarPool)
-    ? o.avatarPool.filter((x): x is string => typeof x === 'string')
-    : []
-  const messages = unpackAvatars(
-    Array.isArray(o.messages) ? (o.messages.filter((m) => m && typeof m === 'object') as ChatMessage[]) : [],
-    avatarPool
-  )
-  // 방별 시트 멤버십 복원 — { playerId: charId[] } 객체.
-  const charRooms = new Map<string, string[]>()
-  if (o.charRooms && typeof o.charRooms === 'object') {
-    for (const [pid, ids] of Object.entries(o.charRooms as Record<string, unknown>)) {
-      if (Array.isArray(ids))
-        charRooms.set(
-          pid,
-          ids.filter((x): x is string => typeof x === 'string')
-        )
-    }
-  }
-  // 세션 멤버 명단 복원 — 재시작에도 한번 접속한 멤버를 권한 대상으로 유지. 전부 오프라인(connected:false)으로 시작.
-  const participants = new Map<string, Participant>()
-  for (const p of Array.isArray(o.participantList) ? o.participantList : []) {
-    if (!p || typeof p !== 'object') continue
-    const pp = p as Record<string, unknown>
-    if (typeof pp.playerId !== 'string' || !pp.playerId) continue
-    participants.set(pp.playerId, {
-      playerId: pp.playerId,
-      nick: typeof pp.nick === 'string' && pp.nick ? pp.nick.slice(0, 80) : '탐사자',
-      color: typeof pp.color === 'string' && pp.color ? pp.color.slice(0, 32) : DEFAULT_PL_COLOR,
-      role: pp.role === 'GM' ? 'GM' : 'PL',
-      connected: false
+/**
+ * opts.auth 미주입 시 비영속 인메모리 스토어(테스트 안전). 운영은 index.ts 에서 영속 스토어 주입.
+ * corsOrigins: null/미설정=전체 허용(*, 개발/로컬). 배열=화이트리스트(공개 배포). Origin 헤더 없음
+ *   (Electron file://·네이티브)은 항상 허용. tls 제공 시 https(wss) 서버, 없으면 http(ws).
+ */
+export function createRelay(opts?: {
+  auth?: AuthStore
+  characters?: CharacterStore
+  rooms?: RoomStore
+  assets?: AssetStore
+  dm?: DmStore
+  notif?: NotifStore
+  posts?: PostStore
+  sessionlogs?: SessionLogStore
+  dottown?: DottownStore
+  economy?: EconStore
+  market?: MarketStore
+  estate?: EstateStore
+  community?: CommunityStore
+  cmtyPosts?: CommunityPostStore
+  cmtyChars?: CommunityCharStore
+  cmtyCatalog?: CommunityCatalog
+  cmtyLedger?: CommunityLedger
+  cmtyGifts?: CommunityGiftStore
+  cmtyEcon?: CommunityEcon
+  cmtyGames?: CommunityGames
+  cmtyQuest?: CommunityQuest
+  cmtySurvey?: CommunitySurvey
+  requireAuth?: boolean
+  corsOrigins?: string[] | null
+  tls?: { key: string; cert: string }
+  /** 서버 데이터 디렉터리(관리자 내보내기/가져오기 대상). 미지정 시 <cwd>/data — 운영 스토어와 동일 기본값. */
+  dataDir?: string
+  /** 웹 클라이언트(웹판) 정적 루트 — build:web 산출물(webdist). 지정 시 미매칭 GET/HEAD 를 실존 파일로 서빙. */
+  webRoot?: string | null
+  /** 이번 기동이 빈 데이터 폴더에서 시작했는가(index.ts 의 checkDataDir 결과). 마커를 남긴 뒤의 재기동은
+   *  내용이 없어도 false(used) — /health 의 data 필드로 노출해, 볼륨이 안 붙은 서버를 밖에서 알아볼 수 있게 한다. */
+  dataFresh?: boolean
+  /** 진단 로거(주입 시 연결/해제·주기 메모리·소켓 수를 호스트 로그로). 미주입(테스트)이면 무음. */
+  log?: (...args: unknown[]) => void
+}): Relay {
+  const store = opts?.rooms ?? new RoomStore()
+  const auth = opts?.auth ?? createAuthStore({ persist: false })
+  const characters = opts?.characters ?? createCharacterStore({ persist: false })
+  const assets = opts?.assets ?? createAssetStore({ persist: false })
+  const dm = opts?.dm ?? createDmStore({ persist: false })
+  const notif = opts?.notif ?? createNotifStore({ persist: false })
+  const posts = opts?.posts ?? createPostStore({ persist: false })
+  const sessionlogs = opts?.sessionlogs ?? createSessionLogStore({ persist: false })
+  const dottown = opts?.dottown ?? createDottownStore({ persist: false })
+  const economy = opts?.economy ?? createEconomyStore({ persist: false })
+  const market = opts?.market ?? createMarketStore({ persist: false })
+  const community = opts?.community ?? createCommunityStore({ persist: false })
+  const cmtyPosts = opts?.cmtyPosts ?? createCommunityPostStore({ persist: false })
+  const cmtyChars = opts?.cmtyChars ?? createCommunityCharStore({ persist: false })
+  const cmtyCatalog = opts?.cmtyCatalog ?? createCommunityCatalog({ persist: false })
+  const cmtyLedger = opts?.cmtyLedger ?? createCommunityLedger({ persist: false })
+  const cmtyGifts = opts?.cmtyGifts ?? createCommunityGiftStore({ persist: false })
+  const cmtyGames = opts?.cmtyGames ?? createCommunityGames({ persist: false })
+  // 도트타운 표시 닉네임 해석(공통) — 도트타운 닉 우선, 없으면 계정 닉네임/아이디. 삭제된 계정이면 ''(호출부 폴백).
+  //   광장/방 아바타 라벨(enter)과 집 위 라벨(estate viewOf)이 같은 규칙으로 최신 닉을 표시하게 공유한다.
+  const displayNick = (id: string): string =>
+    (id && (dottown.getNick(id) || auth.getAccountById(id)?.nickname || auth.getAccountById(id)?.username)) || ''
+  // 도트타운 광장 부동산(빈터 입주·전세/월세) — 코인 차감은 economy.applyDelta 로 수렴(원장·잔액 공유).
+  const estate =
+    opts?.estate ??
+    createEstateStore({
+      persist: false,
+      charge: (id, amt, reason, ref) => economy.applyDelta(id, amt, reason, ref),
+      resolveNick: displayNick
     })
-  }
-  const now = Date.now()
-  return {
-    id: o.id,
-    code: o.code,
-    title: typeof o.title === 'string' && o.title ? o.title : '세션',
-    ownerId: typeof o.ownerId === 'string' ? o.ownerId : '',
-    // 공동 GM 이 없던 시절의 파일에는 이 항목이 없다 — 빈 집합으로 읽으면 소유자만 GM 이던 그대로다.
-    gmIds: new Set(Array.isArray(o.gmIds) ? (o.gmIds as unknown[]).filter((x): x is string => typeof x === 'string') : []),
-    members: new Set(
-      Array.isArray(o.members) ? o.members.filter((m): m is string => typeof m === 'string') : []
-    ),
-    cardImage: typeof o.cardImage === 'string' && o.cardImage ? o.cardImage : undefined,
-    participants, // 영속 복원된 세션 멤버(전부 오프라인) — 재접속 시 admit 이 connected 갱신
-    characters: new Map(),
-    // 로스터(characters)는 접속 중인 사람의 것이라 비우고 시작하지만, 보관대는 맵 토큰이 참조하므로 되살린다.
-    // 파일에서 온 값도 같은 규칙으로 깎는다 — 다른 필드는 전부 캡을 거치는데 여기만 날것으로 두면
-    // 멤버가 올린 번들 하나로 방 파일·입장 전송이 통째로 부푼다.
-    charPool: loadCharPool(o.charPool),
-    handouts,
-    maps,
-    activeMapId:
-      typeof o.activeMapId === 'string' && maps.has(o.activeMapId)
-        ? o.activeMapId
-        : (maps.keys().next().value as string),
-    appearance: normalizeAppearance(o.appearance as Partial<Appearance> | undefined),
-    cutInImage: capImage(o.cutInImage),
-    cutInImages: coerceCutInImages(o.cutInImages),
-    dimColor: coerceDimColor(o.dimColor),
-    madnessTables: coerceMadnessTables(o.madnessTables), // GM 커스텀 광기표
-    insaneTables: coerceInsaneTables(o.insaneTables), // GM 커스텀 인세인 표
-    locked: o.locked === true ? true : undefined, // 입실 잠금(공사중)
-    luckEnabled: typeof o.luckEnabled === 'boolean' ? o.luckEnabled : undefined, // 행운 깎기 사용 여부(미설정=기본 사용)
-    vnOverlay: typeof o.vnOverlay === 'boolean' ? o.vnOverlay : undefined, // VN 오버레이 표시 여부(미설정=꺼짐)
-    plObjects: typeof o.plObjects === 'boolean' ? o.plObjects : undefined, // 참가자 오브젝트 추가 허용(미설정=꺼짐)
-    gmSeeWhispers: o.gmSeeWhispers === true ? true : undefined, // GM 귓속말 열람 여부(미설정=꺼짐)
-    bgm: coerceLoadedBgmList(o.bgm),
-    combat: null, // 전투는 in-memory(비영속) — 재시작 시 초기화
-    saveSlots: coerceSaveSlots(o.saveSlots), // 저장 슬롯 복원(최대 3)
-    visualCards: coerceVisualCards(o.visualCards), // 비주얼 카드 복원
-    decks: coerceDecks(o.decks), // 덱 복원(정의에 없는 카드는 더미에서 걷어낸다)
-    globalTokens: coerceGlobalTokens(o.globalTokens), // 통합 레이어 토큰 복원
-    choices: coerceChoices(o.choices), // GM 선택지 복원(옵션 스크립트·이미 응답한 사람)
-    channels: coerceChannels(o.channels),
-    messages,
-    charRooms,
-    createdAt: typeof o.createdAt === 'number' ? o.createdAt : now,
-    lastActivityAt: typeof o.lastActivityAt === 'number' ? o.lastActivityAt : now
-  }
-}
+  // 부동산 변경 시 광장 차단셀 갱신 + 전체 브로드캐스트. 실제 구현은 plaza 생성 후 주입(아래) — 그 전엔 no-op.
+  let broadcastLots: () => void = () => {}
+  // 전역 프레즌스(누가 지금 접속 중인가) — userId → 그 사용자의 소켓 id 집합. 방과 무관(로비/방 어디든).
+  const presence = new Map<string, Set<string>>()
 
-/** GM 선택지 정규화(로드용) — 메시지 id·옵션 필수, 개수·길이 캡. 구버전 저장본엔 없음(undefined). */
-function coerceChoices(
-  v: unknown
-): Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }> | undefined {
-  if (!Array.isArray(v) || v.length === 0) return undefined
-  const out = new Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }>()
-  for (const raw of v as Record<string, unknown>[]) {
-    if (out.size >= MAX_ROOM_CHOICES) break
-    if (!raw || typeof raw !== 'object' || typeof raw.mid !== 'string' || !raw.mid) continue
-    const options: { id: string; label: string; script?: string }[] = []
-    for (const o of Array.isArray(raw.options) ? (raw.options as Record<string, unknown>[]) : []) {
-      if (options.length >= 10) break
-      if (!o || typeof o.id !== 'string' || !o.id || typeof o.label !== 'string') continue
-      options.push({
-        id: o.id.slice(0, 40),
-        label: o.label.slice(0, 200),
-        script: typeof o.script === 'string' && o.script ? o.script.slice(0, 4000) : undefined
-      })
+  // ===== 프레즌스 상태(수동 온라인/자리비움/세션중/오프라인 표시) =====
+  // 계정 소켓 중 '유효한' 세션방(방 존재 + 참가자 connected)에 있는 소켓이 있으면 세션중으로 파생.
+  // socket.data.roomId 는 추방·방 삭제 시 정리되지 않고 남을 수 있어 store 재검증으로 오탐을 막는다.
+  const inSession = (id: string): boolean => {
+    for (const sid of presence.get(id) ?? []) {
+      const s = io.sockets.sockets.get(sid)
+      const rid = s?.data.roomId
+      if (rid && s && store.getRoom(rid)?.participants.get(s.data.playerId)?.connected) return true
     }
-    if (!options.length) continue
-    // 구버전 저장본은 id 문자열 배열(누가 골랐는지만) — 그때는 고른 항목을 알 수 없으므로 빈 값으로 둔다.
-    const responders = new Map<string, string>()
-    for (const r of Array.isArray(raw.responders) ? raw.responders : []) {
-      if (typeof r === 'string' && r) responders.set(r, '')
-      else if (Array.isArray(r) && typeof r[0] === 'string' && r[0]) responders.set(r[0], typeof r[1] === 'string' ? r[1] : '')
-    }
-    out.set(raw.mid, { options, responders })
-  }
-  return out.size ? out : undefined
-}
-
-/** 그룹 채널 정규화(로드용) — id 필수, 이름 80·멤버 64 캡. */
-function normalizeChannel(c: unknown): Channel | null {
-  if (!c || typeof c !== 'object') return null
-  const o = c as Record<string, unknown>
-  const id = typeof o.id === 'string' && o.id ? o.id.slice(0, 200) : ''
-  if (!id) return null
-  const members = Array.isArray(o.members)
-    ? o.members.filter((m): m is string => typeof m === 'string').slice(0, 64)
-    : []
-  return { id, name: typeof o.name === 'string' ? o.name.slice(0, 80) : '', members }
-}
-function coerceChannels(arr: unknown): Map<string, Channel> {
-  const m = new Map<string, Channel>()
-  for (const c of Array.isArray(arr) ? arr : []) {
-    const n = normalizeChannel(c)
-    if (n) m.set(n.id, n)
-  }
-  return m
-}
-
-/** 전투 상태 방어적 정규화(GM 입력). null/무효/빈 목록=전투 종료. 항목 64·이름 80·id 200 캡, 수치 클램프. */
-function normalizeCombat(state: unknown): CombatState | null {
-  if (!state || typeof state !== 'object') return null
-  const o = state as Record<string, unknown>
-  const num = (v: unknown, d: number): number =>
-    typeof v === 'number' && Number.isFinite(v) ? Math.max(-100000, Math.min(100000, Math.round(v))) : d
-  const list = Array.isArray(o.combatants) ? o.combatants.slice(0, 64) : []
-  const combatants: Combatant[] = []
-  for (const c of list) {
-    if (!c || typeof c !== 'object') continue
-    const r = c as Record<string, unknown>
-    const id = typeof r.id === 'string' && r.id ? r.id.slice(0, 200) : ''
-    if (!id) continue
-    const cc: Combatant = {
-      id,
-      name: typeof r.name === 'string' ? r.name.slice(0, 80) : '',
-      initiative: num(r.initiative, 0)
-    }
-    if (typeof r.charPlayerId === 'string' && r.charPlayerId) cc.charPlayerId = r.charPlayerId.slice(0, 200)
-    if (typeof r.hp === 'number') cc.hp = num(r.hp, 0)
-    if (typeof r.hpMax === 'number') cc.hpMax = num(r.hpMax, 0)
-    combatants.push(cc)
-  }
-  if (combatants.length === 0) return null // 빈 전투 = 종료
-  const round = Math.max(1, num(o.round, 1))
-  const turn = Math.max(0, Math.min(combatants.length - 1, num(o.turn, 0)))
-  return { round, turn, combatants }
-}
-
-export class RoomStore {
-  private rooms = new Map<string, Room>() // key: roomId
-  private codeToId = new Map<string, string>() // 정규화 코드 -> roomId
-  private persist: boolean
-  private roomDir: string
-  private savedAt = new Map<string, number>() // roomId -> 마지막 저장 시점의 lastActivityAt
-  private flushing = new Map<string, Promise<void>>() // 비동기 저장 진행 중인 roomId — 겹쳐쓰기 방지(직전 쓰기 끝나기 전 재진입 차단)
-  /**
-   * 저장이 말썽인 방 — roomId → 사유.
-   * 저장 실패는 서버가 도는 동안에는 아무 티가 안 난다(메모리가 진실원본이라 화면은 멀쩡하다).
-   * 그러다 재시작하면 그 사이 대화가 통째로 사라지므로, 관리 화면에서 미리 보이게 들고 있는다.
-   */
-  private saveTrouble = new Map<string, string>()
-  /**
-   * 이미 잃어버린 것에 대한 기록 — 저장이 나중에 잘된다고 사라지면 안 된다.
-   * '지금 저장이 되는가'(saveTrouble)와 '이미 무엇을 잃었는가'는 다른 이야기다.
-   */
-  private saveLoss = new Map<string, string>()
-  /** 방 폴더를 이미 만들어 뒀는가 — 대화 한 마디마다 폴더를 다시 만들지 않게. */
-  private roomDirReady = false
-  /** 방마다 지금 저장이 시작된 시각 — 너무 오래 매달려 있으면 알린다. */
-  private flushStartedAt = new Map<string, number>()
-  /** 쓰는 중에 또 요청이 와서 '끝나면 한 번 더'로 예약해 둔 방. 예약은 하나면 충분하다. */
-  private queued = new Set<string>()
-  /**
-   * 방마다 지금 쓰고 있는 보관소 조각 — 번호·크기와, 그 조각에 이미 적어 둔 두상 열쇠.
-   * 대화 한 마디마다 폴더를 다시 훑지 않기 위해 들고 있는다(같은 그림을 조각 안에서 두 번 적지 않는 데도 쓴다).
-   */
-  private archiveTips = new Map<string, { part: number; size: number; keys: Set<string> }>()
-  /**
-   * 보관된 대화가 붙잡고 있는 자산 해시 — 채팅에 붙인 그림은 본문에 'asset:<해시>' 참조로만 남는다.
-   * 이걸 세어 두지 않으면 자산 청소가 '아무도 안 쓰는 파일'로 보고 지워, 대화는 남았는데 그림만 사라진다.
-   */
-  private archiveRefs = new Map<string, Set<string>>()
-  /** 방금 읽어 둔 조각들 — 나눠 읽기가 같은 파일을 회차마다 다시 파싱하지 않게(여러 사람이 번갈아 읽어도 견디게 몇 칸). */
-  private archivePages: { roomId: string; part: number; size: number; messages: ChatMessage[] }[] = []
-  /** 보관소가 없다고 확인된 방 — 대부분의 방이 여기 든다. 매 입장마다 폴더를 다시 훑지 않으려고 기억해 둔다. */
-  private archiveNone = new Set<string>()
-  /**
-   * 보관 쓰기가 막힌 방과 다음에 다시 시도할 시각.
-   * 막힌 채로 말이 올 때마다 두드리면 그 동기 쓰기가 서버 전체를 붙든다 — 잠시 쉬었다 다시 본다.
-   */
-  private archiveRetryAt = new Map<string, number>()
-  /**
-   * 보관 쪽 말썽 — 방 저장(.json)이 잘된다고 지워지면 안 된다.
-   * saveTrouble 은 저장이 성공할 때마다 비워지므로, 보관소만 막힌 상태가 그 틈에 감춰지는 것을 막는다.
-   */
-  private archiveTrouble = new Map<string, string>()
-
-  /** persist:true 면 <dataDir>/rooms/*.json 로드·자동저장. 기본 비영속(테스트 안전). */
-  /** 보관 쓰기가 막혔을 때 다시 시도하기까지 쉬는 시간(ms). 테스트가 기다리지 않도록 열어 둔다. */
-  private readonly archiveRetryMs: number
-
-  constructor(opts?: { persist?: boolean; dataDir?: string; archiveRetryMs?: number }) {
-    this.persist = opts?.persist === true
-    this.roomDir = join(opts?.dataDir ?? join(process.cwd(), 'data'), 'rooms')
-    this.archiveRetryMs = opts?.archiveRetryMs ?? ARCHIVE_RETRY_MS
-    if (this.persist) this.loadAll()
-  }
-
-  /** 방 폴더는 처음 한 번만 만든다 — 말 한 마디마다 디스크를 두드릴 일은 아니다. */
-  private ensureRoomDir(): void {
-    if (this.roomDirReady) return
-    mkdirSync(this.roomDir, { recursive: true })
-    this.roomDirReady = true
-  }
-
-  /** 방 하나의 대화 기록장 — 스냅샷 이후에 오간 말만 담기는 덧붙임 파일. */
-  private journalPath(id: string): string {
-    return join(this.roomDir, id + '.chat.jsonl')
-  }
-
-  /**
-   * 대화를 그 자리에서 한 줄 덧붙인다.
-   *
-   * 방 전체 스냅샷은 8초마다 몰아서 쓴다. 그 사이에 서버가 내려가면 그 몇 초가 사라지고,
-   * 스냅샷 쓰기가 막힌 방(너무 커서 직렬화가 안 되거나 디스크가 찬 경우)은 재시작하는 순간
-   * 마지막 저장 이후가 통째로 사라진다.
-   * 그래서 말은 오간 즉시 이 기록장에 한 줄씩 남기고, 스냅샷이 성공한 만큼만 잘라 낸다.
-   * 쓰기가 실패해도 대화 자체는 막지 않는다(대신 관리 화면에 남긴다).
-   */
-  private journal(roomId: string, entry: Record<string, unknown>): void {
-    if (!this.persist) return
-    try {
-      // 기록장을 처음 여는 순간, 이 방이 무엇인지부터 적어 둔다.
-      // 세션 파일이 아직(또는 영영) 없어도 이 한 줄이면 방과 대화를 함께 되살릴 수 있다.
-      if (!existsSync(this.journalPath(roomId))) {
-        const r = this.rooms.get(roomId)
-        if (r) {
-          this.ensureRoomDir()
-          appendFileSync(
-            this.journalPath(roomId),
-            JSON.stringify({
-              op: 'room',
-              r: { id: r.id, code: r.code, title: r.title, ownerId: r.ownerId, members: [...r.members], createdAt: r.createdAt }
-            }) + '\n',
-            'utf8'
-          )
-        }
-      }
-      this.ensureRoomDir()
-      appendFileSync(this.journalPath(roomId), JSON.stringify(entry) + '\n', 'utf8')
-    } catch (e) {
-      this.saveTrouble.set(roomId, `대화 기록장 쓰기 실패: ${String(e)}`)
-    }
-  }
-
-  /** 스냅샷이 담아낸 만큼(cut 바이트)을 기록장에서 덜어낸다. 그 뒤에 들어온 말은 남긴다. */
-  private trimJournal(roomId: string, cut: number): void {
-    if (!this.persist || cut <= 0) return
-    const p = this.journalPath(roomId)
-    try {
-      if (!existsSync(p)) return
-      const buf = readFileSync(p)
-      // 재 두었던 길이보다 파일이 짧아졌다 = 그 사이 누가 갈아치웠다(백업 복원 등).
-      // 그 파일은 우리가 아는 파일이 아니므로 손대지 않는다.
-      if (buf.length < cut) return
-      // 첫 줄(이 방이 무엇인가)은 언제나 남긴다 — 세션 파일이 없어질 때 방을 되살릴 유일한 단서다.
-      const nl = buf.indexOf(0x0a)
-      const headEnd = nl >= 0 && buf.subarray(0, nl).toString('utf8').includes('"op":"room"') ? nl + 1 : 0
-      if (cut <= headEnd) return
-      const tail = cut >= buf.length ? Buffer.alloc(0) : buf.subarray(cut)
-      // 읽고 쓰는 사이에 다른 말이 끼어들 수 없다(추가도 이 스레드에서 동기로 일어난다).
-      writeFileSync(p, Buffer.concat([buf.subarray(0, headEnd), tail]))
-    } catch (e) {
-      this.saveTrouble.set(roomId, `대화 기록장 정리 실패: ${String(e)}`)
-    }
-  }
-
-  /** 기록장의 현재 길이(바이트). 스냅샷을 뜨는 순간을 표시해 둘 때 쓴다. */
-  private journalSize(roomId: string): number {
-    try {
-      return existsSync(this.journalPath(roomId)) ? statSync(this.journalPath(roomId)).size : 0
-    } catch {
-      return 0
-    }
-  }
-
-  // ── 대화 보관소 ──
-  // 방이 메모리에 들고 있을 수 있는 대화 수에는 끝이 있지만, 오간 말에는 끝이 없어야 한다.
-  // 그래서 라이브 창에서 밀려나는 앞부분을 지우지 않고 여기로 옮긴다. 이 파일은 한 번 쓰면
-  // 방을 지우거나 소유자가 채팅을 비울 때 말고는 줄지 않는다(스냅샷·기록장과 달리 정리 대상이 아니다).
-  //
-  // 한 줄이 대화 하나이며, 두상처럼 큰 값은 같은 조각 안에서 한 번만 적고 뒤에서는 열쇠로만 가리킨다
-  // (같은 두상이 만 번 반복되면 보관소가 대화가 아니라 그림으로 가득 차기 때문).
-
-  /** 보관소 조각 경로. 번호가 클수록 최근 몫이다. */
-  private archivePath(id: string, part: number): string {
-    return join(this.roomDir, id + '.archive.' + String(part).padStart(3, '0') + '.jsonl')
-  }
-
-  /** 이 방의 보관소 조각 번호(오름차순). 없으면 빈 배열. */
-  private archiveParts(id: string): number[] {
-    try {
-      if (!existsSync(this.roomDir)) return []
-      const head = id + '.archive.'
-      const out: number[] = []
-      for (const f of readdirSync(this.roomDir)) {
-        if (!f.startsWith(head) || !f.endsWith('.jsonl')) continue
-        const n = Number(f.slice(head.length, -'.jsonl'.length))
-        if (Number.isInteger(n) && n > 0) out.push(n)
-      }
-      return out.sort((a, b) => a - b)
-    } catch {
-      return []
-    }
-  }
-
-  /** 보관된 대화가 붙잡고 있는 자산 목록 파일. 조각과 함께 나고 함께 걷힌다. */
-  private archiveRefsPath(id: string): string {
-    return join(this.roomDir, id + '.archive.refs')
-  }
-
-  /**
-   * 이 방의 보관 대화가 붙잡고 있는 자산 해시 집합.
-   * 목록 파일이 없으면 조각을 한 번 통째로 훑어 세우고 파일로 남긴다(이 판 이전에 쌓인 보관소 대비).
-   */
-  private archiveRefSet(roomId: string): Set<string> {
-    const cached = this.archiveRefs.get(roomId)
-    if (cached) return cached
-    const out = new Set<string>()
-    let loaded = false
-    try {
-      for (const line of splitLines(readFileSync(this.archiveRefsPath(roomId)))) {
-        const h = line.toString('utf8').trim()
-        if (h) out.add(h)
-      }
-      loaded = true
-    } catch {
-      loaded = false // 목록이 아직 없다 — 아래에서 세운다
-    }
-    if (!loaded) {
-      const parts = this.archiveParts(roomId)
-      if (parts.length) {
-        for (const p of parts) {
-          try {
-            const text = readFileSync(this.archivePath(roomId, p), 'utf8')
-            scanAssetRefs(text, out) // 본문에 참조로 남은 그림
-            // 사전에 통째로 실린 두상 — 덧붙일 때와 같은 기준으로 세야 목록이 어긋나지 않는다.
-            for (const mt of text.matchAll(ARCHIVE_AVATAR_KEY_RE)) out.add(mt[1])
-          } catch {
-            /* 조각 하나를 못 읽어도 나머지는 센다 */
-          }
-        }
-        try {
-          writeFileSync(this.archiveRefsPath(roomId), [...out].map((h) => h + '\n').join(''), 'utf8')
-        } catch {
-          /* 못 남겨도 이번 가동 동안은 메모리로 버틴다 */
-        }
-      }
-    }
-    this.archiveRefs.set(roomId, out)
-    return out
-  }
-
-  /** 지금 쓰고 있는 조각(없으면 폴더를 한 번 훑어 세운다). 이후로는 들고 있는 값만 쓴다. */
-  private archiveTip(roomId: string): { part: number; size: number; keys: Set<string> } {
-    let tip = this.archiveTips.get(roomId)
-    if (!tip) {
-      const parts = this.archiveParts(roomId)
-      const part = parts.length ? parts[parts.length - 1] : 1
-      let size = 0
-      try {
-        size = statSync(this.archivePath(roomId, part)).size
-      } catch {
-        size = 0 // 아직 없는 조각 — 0 부터 시작
-      }
-      if (size > 0) {
-        // 끝 줄이 개행으로 닫혔는지 본다 — 정전으로 반쪽만 남은 줄 뒤에 다음 몫을 그대로 이어 붙이면
-        // 두 줄이 한 줄로 붙어 함께 못 읽게 되는데, 새로 붙인 쪽은 이미 메모리에서 덜어낸 뒤라 사본이 없다.
-        // 반쪽 줄은 개행으로 닫아 그 줄 하나만 잃는 것으로 끝낸다(그쪽은 스냅샷·기록장에 남아 있다).
-        try {
-          const fd = openSync(this.archivePath(roomId, part), 'r')
-          try {
-            const last = Buffer.alloc(1)
-            readSync(fd, last, 0, 1, size - 1)
-            if (last[0] !== 0x0a) {
-              appendFileSync(this.archivePath(roomId, part), '\n', 'utf8')
-              size += 1
-            }
-          } finally {
-            closeSync(fd)
-          }
-        } catch {
-          /* 못 보면 그대로 이어 쓴다 — 확인 실패가 보관 자체를 막지는 않게 */
-        }
-      }
-      // 이어 쓰는 조각의 두상 사전은 비운 채로 시작한다 — 이미 적힌 그림을 한 번 더 적을 뿐 손실은 없다.
-      tip = { part, size, keys: new Set<string>() }
-      this.archiveTips.set(roomId, tip)
-    }
-    return tip
-  }
-
-  /**
-   * 대화를 보관소 끝에 덧붙인다. 성공하면 true — **false 면 부르는 쪽은 메모리에서 덜어내면 안 된다.**
-   * 큰 두상은 이 조각에 처음 나올 때만 통째로 적고, 그 뒤로는 열쇠로만 가리킨다.
-   */
-  private archiveAppend(roomId: string, messages: ChatMessage[]): boolean {
-    if (!this.persist || !messages.length) return true
-    // 실패하면 여기까지 되잘라 '디스크에는 적혔는데 아무도 모르는' 반쪽 상태를 남기지 않는다.
-    // 그 상태를 두면 다음 회차가 같은 앞부분을 통째로 다시 적어 조각이 눈덩이처럼 붇는다.
-    const undo: { part: number; size: number }[] = []
-    try {
-      this.ensureRoomDir()
-      const tip = this.archiveTip(roomId)
-      const refs = this.archiveRefSet(roomId)
-      // 쓰기가 끝나기 전에는 들고 있는 값을 고치지 않는다 — 실패했는데 '적었다'고 표시해 두면,
-      // 다음 시도에서 두상 사전 줄을 건너뛰어 그 그림이 어디에도 없게 된다.
-      let part = tip.part
-      let size = tip.size
-      const keys = new Set(tip.keys) // 조각이 바뀌면 두상 사전도 새로 시작한다
-      const addedRefs = new Set<string>()
-      let body = ''
-      let pending = 0 // 아직 안 내보낸 몫의 바이트 수 — 조각 상한은 이것까지 세어야 걸린다
-      /** 모인 몫을 지금 조각에 내보낸다. 실패하면 catch 가 되돌린다. */
-      const emit = (): void => {
-        if (!body) return
-        let before = 0
-        try {
-          before = statSync(this.archivePath(roomId, part)).size
-        } catch {
-          before = 0 // 아직 없는 조각
-        }
-        undo.push({ part, size: before })
-        appendFileSync(this.archivePath(roomId, part), body, 'utf8')
-        size += pending
-        pending = 0
-        // 이 대화가 붙잡고 있는 그림도 함께 적어 둔다 — 자산 청소가 살아 있는 그림으로 세게 한다.
-        // 본문에 참조로 남는 그림(asset:…)과, 사전에 통째로 실린 두상 둘 다 세야 한다.
-        const fresh = new Set<string>()
-        scanAssetRefs(body, fresh)
-        for (const k of keys) if (!refs.has(k)) fresh.add(k)
-        const add = [...fresh].filter((h) => !refs.has(h) && !addedRefs.has(h))
-        if (add.length) {
-          appendFileSync(this.archiveRefsPath(roomId), add.map((h) => h + '\n').join(''), 'utf8')
-          for (const h of add) addedRefs.add(h)
-        }
-        body = ''
-      }
-      /** 한 줄을 모아 두고 그 길이만큼 센다. */
-      const push = (line: string): void => {
-        body += line + '\n'
-        pending += Buffer.byteLength(line, 'utf8') + 1
-      }
-      for (const m of messages) {
-        // 한 번에 큰 묶음이 들어와도(계정 이전 가져오기 등) 조각 상한을 지킨다 — 넘치면 그 자리에서 조각을 넘긴다.
-        if (size + pending >= ARCHIVE_PART_BYTES && part < ARCHIVE_PART_MAX) {
-          emit()
-          part++
-          size = 0
-          keys.clear()
-        }
-        const key = m.avatar ? dataUrlHash(m.avatar) : null
-        if (!key) {
-          push(JSON.stringify({ op: 'm', m }))
-          continue
-        }
-        if (!keys.has(key)) {
-          push(JSON.stringify({ op: 'av', k: key, d: m.avatar }))
-          keys.add(key)
-        }
-        const lean: ChatMessage = { ...m }
-        delete lean.avatar
-        push(JSON.stringify({ op: 'm', m: lean, a: key }))
-      }
-      emit()
-      // 여기까지 왔으면 확정 — 이제야 들고 있는 값을 옮긴다.
-      tip.part = part
-      tip.size = size
-      tip.keys.clear()
-      for (const k of keys) tip.keys.add(k)
-      for (const h of addedRefs) refs.add(h)
-      this.archiveNone.delete(roomId)
-      this.archiveTrouble.delete(roomId) // 다시 써진다 — 막혔다는 표시를 걷는다
-      return true
-    } catch (e) {
-      // 나가다 만 몫을 되잘라 없던 일로 만든다(되자르기까지 실패하면 아래 알림으로 남는다).
-      for (const u of undo.reverse()) {
-        try {
-          truncateSync(this.archivePath(roomId, u.part), u.size)
-        } catch {
-          // 되자르기 실패 — 중복이 남을 수 있고(읽을 때 같은 id 를 걸러 낸다), 꼬리가 반쪽 줄로
-          // 끊겨 있을 수도 있다. 들고 있던 조각 정보를 버려, 다음 시도가 꼬리부터 다시 살피게 한다.
-          this.archiveTips.delete(roomId)
-        }
-      }
-      // 여기서 실패했다는 것은 덜어낼 대화의 갈 곳이 없다는 뜻이다. 관리 화면에 남기고,
-      // 부르는 쪽은 메모리에 그대로 둔다(줄지 않는 대신 잃지도 않는다).
-      // 방 저장(.json)이 잘되면 saveTrouble 은 비워지므로, 보관 쪽 사유는 따로 들고 있어야 감춰지지 않는다.
-      const first = !this.archiveTrouble.has(roomId)
-      this.archiveTrouble.set(roomId, `대화 보관소 쓰기 실패: ${String(e)}`)
-      // 로그는 처음 한 번만 — 말이 올 때마다 스택을 찍으면 진짜 원인이 그 안에 묻힌다(재시도는 쉬었다 한다).
-      if (first) console.error(`[rooms] ${roomId} 대화 보관 실패. 오래된 대화를 메모리에 그대로 둔다:`, e)
-      return false
-    }
-  }
-
-  /**
-   * 보관소 조각 하나를 통째로 읽어 대화 목록으로 되돌린다(두상 사전 해소 포함). 깨진 줄은 건너뛴다.
-   * 방금 읽은 조각 하나는 들고 있는다 — 나눠 읽기는 같은 조각을 여러 번 훑으므로,
-   * 캐시가 없으면 한 번 넘길 때마다 8MB 파일을 다시 읽고 다시 파싱해 서버가 그 동안 멈춘다.
-   */
-  private archiveRead(roomId: string, part: number): ChatMessage[] {
-    let size = -1
-    try {
-      size = statSync(this.archivePath(roomId, part)).size
-    } catch {
-      return []
-    }
-    const hit = this.archivePages.find((p) => p.roomId === roomId && p.part === part && p.size === size)
-    if (hit) return hit.messages
-    let lines: Buffer[]
-    try {
-      lines = splitLines(readFileSync(this.archivePath(roomId, part)))
-    } catch {
-      return []
-    }
-    const pool = new Map<string, string>()
-    const out: ChatMessage[] = []
-    for (const line of lines) {
-      if (!line.length) continue
-      try {
-        const e = JSON.parse(line.toString('utf8')) as Record<string, unknown>
-        if (e.op === 'av') {
-          if (typeof e.k === 'string' && typeof e.d === 'string') pool.set(e.k, e.d)
-          continue
-        }
-        if (e.op !== 'm' || !e.m || typeof e.m !== 'object') continue
-        const m = e.m as ChatMessage
-        if (typeof m.id !== 'string' || !m.id) continue
-        if (typeof e.a === 'string') {
-          const avatar = pool.get(e.a)
-          if (avatar) m.avatar = avatar
-        }
-        out.push(m)
-      } catch {
-        /* 줄 하나가 깨져도 나머지는 살린다 */
-      }
-    }
-    this.archivePages.unshift({ roomId, part, size, messages: out })
-    if (this.archivePages.length > ARCHIVE_PAGE_CACHE) this.archivePages.length = ARCHIVE_PAGE_CACHE
-    return out
-  }
-
-  /**
-   * 라이브 창에서 넘치는 앞부분을 보관소로 옮기고 메모리에서 덜어낸다.
-   * 보관에 실패하면 덜어내지 않는다 — 사본 없이 지우면 그 대화는 어디에도 남지 않는다.
-   */
-  private evictOldest(room: Room, keep: number): void {
-    if (room.messages.length <= keep) return
-    if (Date.now() >= (this.archiveRetryAt.get(room.id) ?? 0)) {
-      // 한 번에 옮기는 몫에 끝을 둔다 — 쓰기가 막혀 있으면 실패할 때마다 밀린 전량을 다시 직렬화하게 되고,
-      // 그 비용이 쌓인 만큼 커져(동기 실행이라) 방 하나가 서버 전체를 붙든다.
-      // 다만 잘 써지는 동안에는 다 옮길 때까지 배치를 이어 간다 — 계정 이전 가져오기처럼 한 번에
-      // 수만 건이 올 때 한 배치만 옮기고 손을 놓으면, 나머지가 아래 마지막 선에서 사본 없이 잘려 나간다.
-      while (room.messages.length > keep) {
-        const take = Math.min(room.messages.length - keep, ARCHIVE_APPEND_MAX)
-        if (!this.archiveAppend(room.id, room.messages.slice(0, take))) {
-          this.archiveRetryAt.set(room.id, Date.now() + this.archiveRetryMs)
-          break
-        }
-        this.archiveRetryAt.delete(room.id)
-        room.messages.splice(0, take)
-      }
-      if (room.messages.length <= keep) return
-    }
-    // 보관이 막힌 동안에도 마지막 선은 있어야 한다. 여기까지 왔다면 디스크가 이미 망가진 상태다 —
-    // 그대로 두면 이 방이 부풀어 서버가 죽고, 그러면 다른 방들의 최근 대화까지 함께 잃는다.
-    const over = room.messages.length - MAX_HISTORY_HARD
-    if (over > 0) {
-      room.messages.splice(0, over)
-      this.saveLoss.set(
-        room.id,
-        `대화 보관소에 쓰지 못해 오래된 대화를 덜어냈습니다. 디스크 여유와 데이터 폴더 권한을 확인해 주세요.`
-      )
-    }
-  }
-
-  /** 방의 보관소를 걷는다 — 방을 지우거나 소유자가 채팅을 비울 때만. */
-  private removeArchive(id: string): void {
-    if (!this.persist) return
-    for (const p of this.archiveParts(id)) {
-      try {
-        unlinkSync(this.archivePath(id, p))
-      } catch {
-        /* 이미 없으면 그만 */
-      }
-    }
-    try {
-      unlinkSync(this.archiveRefsPath(id)) // 그림 목록도 함께 — 남겨 두면 지운 방의 그림을 영영 붙잡는다
-    } catch {
-      /* 이미 없으면 그만 */
-    }
-    this.archiveTips.delete(id)
-    this.archiveRefs.delete(id)
-    this.archiveNone.delete(id)
-    this.archiveRetryAt.delete(id)
-    this.archiveTrouble.delete(id)
-    this.archivePages = this.archivePages.filter((p) => p.roomId !== id)
-  }
-
-  /** 보관소에 담긴 대화가 있는지(채팅 창의 '더 불러오기' 표시 여부). */
-  hasArchive(roomId: string): boolean {
-    if (!this.persist) return false
-    if (this.archiveNone.has(roomId)) return false // 없다고 이미 확인한 방(대부분이 여기)
-    if (this.archiveTips.has(roomId)) return true // 이 판에서 보관해 본 방
-    // 조각은 1번부터 나고 지워지지 않는다 — 폴더를 통째로 훑기 전에 첫 조각부터 본다(입장마다 도는 길이다).
-    try {
-      if (existsSync(this.archivePath(roomId, 1))) return true
-    } catch {
-      /* 아래에서 다시 본다 */
-    }
-    if (this.archiveParts(roomId).length > 0) return true
-    this.archiveNone.add(roomId) // 다음 입장부터는 폴더를 다시 훑지 않는다(보관이 시작되면 지워진다)
     return false
   }
-
-  /**
-   * 보관 대화 되읽기(입장 스냅샷과 같은 꼴) — 열람권 필터와 두상 풀 분리까지 마친 결과.
-   * 방이 없거나 그 사람이 방에 없으면 null.
-   */
-  archivedFor(
-    roomId: string,
-    viewer: { playerId: string; role: Participant['role'] },
-    cursor: { part: number; line: number } | null,
-    limit: number
-  ): { messages: ChatMessage[]; avatarPool: string[]; cursor: { part: number; line: number } | null } | null {
-    const room = this.rooms.get(roomId)
-    if (!room) return null
-    const got = this.archivedBefore(roomId, cursor, limit, (m) =>
-      canSeeMessage(m, viewer, (gid) => this.canAccessChannel(roomId, gid, viewer.playerId))
-    )
-    const { messages, avatarPool } = packAvatars(got.messages)
-    return { messages, avatarPool, cursor: got.cursor }
+  // 실효 상태 — 우선순위: 오프라인(null) > invisible > 수동 away/session > 자동 session > online.
+  const effectiveStatus = (id: string): PresenceStatus | null => {
+    if (!presence.get(id)?.size) return null
+    const manual = auth.getStatus(id) ?? 'online'
+    if (manual !== 'online') return manual
+    return inSession(id) ? 'session' : 'online'
   }
-
-  /**
-   * 보관된 대화를 처음부터 끝까지(그 사람이 볼 수 있는 것만). 계정 이전용 내보내기가 쓴다.
-   * 통째로 메모리에 올리는 길이라 상한을 둔다 — 넘치면 최근 쪽을 남기고 truncated 로 알린다.
-   */
-  archivedAll(
-    roomId: string,
-    viewer: { playerId: string; role: Participant['role'] },
-    max = ARCHIVE_EXPORT_MAX
-  ): { messages: ChatMessage[]; truncated: boolean } {
-    const parts = this.archiveParts(roomId)
-    if (!parts.length) return { messages: [], truncated: false }
-    // 방장은 지금 접속 중이 아니어도 그 방의 GM 이다 — 라이브 몫을 거르는 규칙과 같아야
-    // 자기 방 그룹 대화가 보관분에서만 조용히 빠지는 일이 없다(exportOwnedBy 와 짝).
-    // 다만 **지운 채널까지 통과시키면 안 된다** — 라이브 몫은 지울 때 함께 사라지지만 보관분은 남아 있어서,
-    // 그냥 두면 '지웠다'고 한 그룹 대화가 내보내기 파일에서만 되살아난다.
-    const room = this.rooms.get(roomId)
-    const canSee = (m: ChatMessage): boolean =>
-      canSeeMessage(
-        m,
-        viewer,
-        (gid) =>
-          !!room?.channels.has(gid) &&
-          (viewer.role === 'GM' || this.canAccessChannel(roomId, gid, viewer.playerId))
-      )
-    const out: ChatMessage[] = []
-    // 서버가 갑자기 죽었다 살아난 회차에는 같은 말이 조각에 두 번 적혀 있을 수 있다 — 내보내기에는 한 번만 싣는다.
-    const seen = new Set<string>()
-    let truncated = false
-    // 뒤에서부터 채운다 — 상한에 걸리면 최근 쪽이 남아야 한다.
-    for (let i = parts.length - 1; i >= 0; i--) {
-      const chunk = this.archiveRead(roomId, parts[i]).filter((m) => {
-        if (!canSee(m) || seen.has(m.id)) return false
-        seen.add(m.id)
-        return true
-      })
-      if (out.length + chunk.length > max) {
-        out.unshift(...chunk.slice(chunk.length - (max - out.length)))
-        truncated = true
-        break
-      }
-      out.unshift(...chunk)
+  // 외부 노출용 — invisible 은 오프라인으로 위장. 모든 online 판정은 이 두 헬퍼만 거친다(위장 누수 방지 단일 지점).
+  const visibleOnline = (id: string): boolean => {
+    const st = effectiveStatus(id)
+    return !!st && st !== 'invisible'
+  }
+  const publicStatus = (id: string): PublicPresenceStatus | undefined => {
+    const st = effectiveStatus(id)
+    return !st || st === 'invisible' ? undefined : st
+  }
+  // 마지막으로 브로드캐스트한 표시 상태(계정별) — 중복 emit 억제. 오프라인/위장은 항목 자체를 지운다.
+  const shownStatus = new Map<string, PublicPresenceStatus>()
+  const syncPresence = (id: string): void => {
+    if (!id) return
+    const st = effectiveStatus(id)
+    const pub = !st || st === 'invisible' ? null : st
+    const prev = shownStatus.get(id) ?? null
+    if (pub === prev) return
+    if (pub) {
+      shownStatus.set(id, pub)
+      io.emit('dm:presence', { userId: id, online: true, status: pub })
+    } else {
+      shownStatus.delete(id)
+      io.emit('dm:presence', { userId: id, online: false })
     }
-    return { messages: out, truncated }
   }
 
-  /** 방별 보관소 크기(바이트) — 관리 화면 표시용. */
-  archiveBytes(roomId: string): number {
-    let sum = 0
-    for (const p of this.archiveParts(roomId)) {
-      try {
-        sum += statSync(this.archivePath(roomId, p)).size
-      } catch {
-        /* 세는 사이 사라졌으면 그만 */
-      }
-    }
-    return sum
+  // ===== 로비 알림(종) — 저장 + 대상 개인룸 실시간 push. push 가 자기알림/무효로 null 이면 no-op. =====
+  const notify = (ownerId: string, n: NotifInput): void => {
+    const item = notif.push(ownerId, n)
+    if (item) io.to('user:' + ownerId).emit('notif:new', item)
   }
+  /** 알림 액터 스냅샷(작성 시점 이름·아바타 — 탈퇴해도 표시 유지). */
+  const actorOf = (a: PublicAccount): { id: string; name: string; avatar?: string } => ({
+    id: a.id,
+    name: a.nickname || a.username,
+    ...(a.avatar ? { avatar: a.avatar } : {})
+  })
+  // DM 전송 레이트리밋(계정당 슬라이딩 윈도) — 고빈도 전송의 동기 디스크 쓰기로 이벤트 루프가 멈추는 것 방지.
+  const dmRate = new Map<string, { count: number; resetAt: number }>()
+  // DM 조회 레이트리밋(목록·대화·열람표시) — 전송과 별도 버킷. 클라가 되풀이에 빠져도 서버 한 대가
+  // 그 한 사람 때문에 모두에게 느려지지 않게 한다.
+  const dmReadRate = new Map<string, { count: number; resetAt: number }>()
+  // 도트타운 경제 레이트리밋 — 알바/구매/일일 라우트의 자동화 스팸(동기 디스크 쓰기 루프) 차단(DM 과 동일 사상).
+  const econRate = new Map<string, { count: number; resetAt: number }>()
+  // 마이룸 소셜(좋아요·방문·방명록) 레이트리밋 — 경제와 별도 버킷(계정당 10초 40건). 좋아요 코인 보상 남발/스팸 차단.
+  const socialRate = new Map<string, { count: number; resetAt: number }>()
+  // 프레즌스 상태 변경 레이트리밋 — presence:set 폭주(동기 디스크쓰기·전역 브로드캐스트 반복) 차단.
+  const presenceRate = new Map<string, { count: number; resetAt: number }>()
+  // 보관 대화 되읽기(chat:older) 부하 가드 — 아래 둘을 함께 쓴다.
+  // 사람 단위: 창을 여러 개 띄워도(소켓이 여러 개라도) 한 번에 한 요청만. 소켓 단위로 재면 창 수만큼 뚫린다.
+  const olderBusyBy = new Set<string>()
+  // 서버 단위: 조각 하나를 통째로 읽는 동기 작업이라, 동시에 몰리면 그만큼 서버 전체가 멈춘다. 끝을 둔다.
+  let olderInFlight = 0
+  const OLDER_INFLIGHT_MAX = 4
+  const LIKE_REWARD = 10 // 새 방문자가 내 방에 좋아요를 누르면 소유주가 받는 코인(쌍당 1회 — 파밍 불가)
+  const MARKET_FEE_PCT = 10 // 마켓 판매 수수료(%) — 창작자는 가격의 90%를 받고 10%는 소각(sink)
+  const MARKET_FILE_MAX = 256 * 1024 // 마켓 이미지 파일당 최대 바이트(강한 캡)
+  const CHAR_CANVAS = { w: 48, h: 64 } // 의상 파일 필수 치수(캐릭터 캔버스)
+  const FURN_MAX = 256 // 가구 스프라이트 최대 한 변(px)
+  const requireAuth = opts?.requireAuth === true
+  const corsOrigins = opts?.corsOrigins ?? null
+  const dataDir = opts?.dataDir ?? join(process.cwd(), 'data') // 관리자 서버 백업/복원 대상(운영 스토어와 동일 기본 경로)
+  const log = opts?.log ?? ((): void => {}) // 진단 로그(미주입이면 무음 — 테스트 소음 방지)
 
-  /**
-   * 보관된 대화를 뒤에서부터 되읽는다(오래된 순으로 정렬해 돌려준다).
-   * cursor 는 다음 요청에 그대로 돌려주면 되는 표식이며, null 이면 보관소의 맨 끝부터 읽는다.
-   * 볼 수 없는 대화(귓속말·비밀·남의 그룹)는 여기서 걸러 내보낸다 — 화면 은닉을 믿지 않는다.
-   */
-  archivedBefore(
-    roomId: string,
-    cursor: { part: number; line: number } | null,
-    limit: number,
-    canSee: (m: ChatMessage) => boolean
-  ): { messages: ChatMessage[]; cursor: { part: number; line: number } | null } {
-    const parts = this.archiveParts(roomId)
-    if (!parts.length) return { messages: [], cursor: null }
-    // 정수로 못 박는다 — 소수가 새어 들어오면 줄 번호가 소수가 되고, 그 표식은 다음 요청에서 거부돼
-    // 되읽기가 그 자리에서 영영 멈춘다.
-    const want = Math.max(1, Math.min(ARCHIVE_PAGE_MAX, Math.floor(Number(limit) || 0) || 1))
-    let pi = parts.length - 1
-    let line = -1 // -1 = 이 조각의 끝에서부터
-    if (cursor) {
-      pi = parts.indexOf(cursor.part)
-      if (pi < 0) return { messages: [], cursor: null } // 그 사이 걷힌 조각 — 더 줄 것이 없다
-      line = cursor.line
-    }
-    const out: ChatMessage[] = []
-    // 서버가 갑자기 죽었다 살아난 회차에는 같은 말이 조각에 두 번 적혀 있을 수 있다 — 한 묶음 안에서는 한 번만 담는다.
-    const seen = new Set<string>()
-    let scanned = 0
-    while (pi >= 0 && out.length < want && scanned < ARCHIVE_SCAN_LIMIT) {
-      const all = this.archiveRead(roomId, parts[pi])
-      if (line < 0 || line > all.length) line = all.length
-      if (line === 0) {
-        pi--
-        line = -1
-        continue
-      }
-      const from = Math.max(0, line - (want - out.length))
-      out.unshift(
-        ...all.slice(from, line).filter((m) => {
-          if (!canSee(m) || seen.has(m.id)) return false
-          seen.add(m.id)
-          return true
-        })
-      )
-      scanned += line - from
-      line = from
-      if (line === 0) {
-        pi--
-        line = -1
-      }
-    }
-    return { messages: out, cursor: pi >= 0 ? { part: parts[pi], line } : null }
-  }
-
-  /**
-   * 반쪽(축약) 저장이 담기는 비상 사본. 본 저장본(.json)과 이름을 갈라 두는 이유 —
-   * 반쪽이 본 저장본을 덮으면 거기 있던 옛 대화의 유일한 디스크 사본이 사라진다.
-   */
-  private rescuePath(id: string): string {
-    return join(this.roomDir, id + '.rescue.json')
-  }
-
-  /** 비상 사본을 방으로 읽는다(본 저장본과 같은 꼴). 없거나 못 읽으면 null. */
-  private roomFromRescue(id: string): Room | null {
+  // 인라인 data URL 이미지를 서버 자산 저장소에 넣고 'asset:<해시>' 로 치환(콘텐츠 주소·중복 제거). data URL 이
+  // 아니거나 디코드/저장에 실패하면 원본을 그대로 둔다(렌더 안전 — 최악이라도 인라인 유지, 끊김 없음).
+  const internalizeInlineImage = async (s: string): Promise<string> => {
+    if (typeof s !== 'string' || !s.startsWith('data:')) return s
+    const comma = s.indexOf(',')
+    if (comma < 0) return s
+    const meta = s.slice(5, comma) // 예: 'image/png;base64'
+    if (!/;base64$/i.test(meta)) return s
+    const mime = meta.slice(0, -7) // ';base64' 제거
     try {
-      if (!existsSync(this.rescuePath(id))) return null
-      const room = roomFromFile(JSON.parse(readFileSync(this.rescuePath(id), 'utf8')))
-      return room && room.id === id ? room : null
+      const bytes = Buffer.from(s.slice(comma + 1), 'base64')
+      if (bytes.length === 0) return s
+      return 'asset:' + (await assets.put(bytes, mime))
     } catch {
-      return null
+      return s
     }
   }
 
+  // 입장/싱크 스냅샷의 두상 풀(avatarPool)을 asset 참조로 경량화 — 콜드 재입장마다 수십 MB 인라인 풀을 통째
+  // 재전송하지 않도록 한다. 풀 이미지는 콘텐츠 주소로 한 번만 저장되고 스냅샷엔 'asset:<해시>'(수십 바이트)만
+  // 실린다. 클라는 입장 시 풀을 hydrate 해 기존 채팅·동결·내보내기 코드에 data URL 그대로 넘긴다.
+  // 라이브 chat:new 두상은 인라인 유지(동결·내보내기 경로 무변경).
   /**
-   * 비상 사본에만 남은 말을 채워 넣는다 — 기록장 쓰기가 실패했던 몫이 여기서 돌아온다.
-   * 기록장이 온전했다면 전부 이미 아는 말이라 0건으로 끝난다.
-   * 자리 잡기는 기록장 복구와 같은 규칙: 아는 말 뒤를 가리키는 자리를 옮겨 가며 모르는 말을 끼운다.
-   * 사본은 뜬 시점의 과거 상태다 — 그 뒤 기록장이 지웠거나(replay.deleted) 통째로 비운(replay.cleared)
-   * 말을 여기서 되살리면 안 된다. 지운 말이 부활하는 것이 놓친 말을 못 줍는 것보다 나쁘다.
-   */
-  private mergeRescue(room: Room, replay?: { deleted: Set<string>; cleared: boolean }): number {
-    if (replay?.cleared) return 0
-    const saved = this.roomFromRescue(room.id)
-    if (!saved) return 0
-    let applied = 0
-    const seen = new Set(room.messages.map((m) => m.id))
-    let at: number | null = null
-    let pending: ChatMessage[] = []
-    const placePending = (before: number): void => {
-      if (!pending.length) return
-      room.messages.splice(before, 0, ...pending)
-      pending = []
-    }
-    for (const m of saved.messages) {
-      if (!m.id) continue
-      if (replay?.deleted.has(m.id)) continue
-      if (seen.has(m.id)) {
-        const i = room.messages.findIndex((x) => x.id === m.id)
-        if (i >= 0) {
-          placePending(i)
-          at = room.messages.findIndex((x) => x.id === m.id) + 1
-        }
-        continue
-      }
-      if (at === null) pending.push(m)
-      else {
-        room.messages.splice(at, 0, m)
-        at++
-      }
-      seen.add(m.id)
-      applied++
-    }
-    placePending(room.messages.length)
-    this.evictOldest(room, MAX_HISTORY)
-    return applied
-  }
-
-  /** 기록장 머리글만으로 방의 뼈대를 세운다(세션 파일이 없을 때의 마지막 수단). */
-  private roomFromJournalHead(id: string): Room | null {
-    try {
-      const buf = readFileSync(this.journalPath(id))
-      const first = splitLines(buf)[0]
-      if (!first) return null
-      const e = JSON.parse(first.toString('utf8')) as Record<string, unknown>
-      if (e.op !== 'room' || !e.r || typeof e.r !== 'object') return null
-      const room = roomFromFile(e.r as Record<string, unknown>)
-      return room && !this.codeToId.has(room.code) ? room : null
-    } catch {
-      return null
-    }
-  }
-
-  /**
-   * 스냅샷 이후의 대화를 기록장에서 되살린다.
-   * 같은 말을 두 번 넣지 않도록 id 로 거르고, 고침·지움·비움도 순서대로 다시 적용한다.
+   * 목록에 실어 보내는 프사를 가볍게 — 인라인 data URL 은 자산으로 넣고 'asset:<해시>' 참조만 남긴다.
    *
-   * 자리도 기록장이 정한다. 되살릴 말이 스냅샷의 것보다 앞설 수 있어서(반쪽 저장 뒤 복구)
-   * 뒤에 붙이면 순서가 뒤집힌다. 시각으로 다시 세우는 것도 못 미덥다 — 같은 밀리초에 오간 말은
-   * 가릴 수 없다. 그래서 기록장을 훑으며 '아는 말 바로 뒤'를 가리키는 자리를 옮겨 가고,
-   * 모르는 말은 그 자리에 끼워 넣는다. 기록장이 곧 오간 차례이므로 이러면 그대로 복원된다.
+   * 프사 한 장이 최대 900KB 인데 DM 목록은 대화마다, 그룹은 멤버마다 그것을 통째로 싣는다. 대화가 스무 개면
+   * 응답 하나가 수십 MB 로 부풀고, 그 크기가 문자열과 버퍼로 두세 번 복제되며 봉우리를 만든다. 요청 하나가
+   * 실패하는 정도면 그 사람만 불편하지만, 그 봉우리에 서버가 걸려 넘어지면 접속해 있던 사람이 전부 끊긴다.
+   * 자산화에 실패한 그림은 아예 빼서(이름 첫 글자로 대체) 봉우리 자체를 만들지 않는다.
    */
-  private replayJournal(room: Room): { applied: number; deleted: Set<string>; cleared: boolean } {
-    const p = this.journalPath(room.id)
-    /** 지운 말의 id 와 비움 여부 — 비상 사본 병합이 지난 상태를 되살리지 않도록 넘겨준다. */
-    const deleted = new Set<string>()
-    let cleared = false
-    if (!existsSync(p)) return { applied: 0, deleted, cleared }
-    let applied = 0
-    try {
-      const seen = new Set(room.messages.map((m) => m.id))
-      /** 다음에 모르는 말을 끼워 넣을 자리. 아직 아는 말을 못 만났으면 null. */
-      let at: number | null = null
-      /** 아는 말을 만나기 전에 나온 모르는 말들 — 그 아는 말 바로 앞에 들어가야 한다. */
-      let pending: ChatMessage[] = []
-      const placePending = (before: number): void => {
-        if (!pending.length) return
-        room.messages.splice(before, 0, ...pending)
-        pending = []
-      }
-      // 통째로 문자열로 만들지 않는다 — 되살릴 것이 많은 방일수록 파일이 크고,
-      // 문자열 한계에 걸리면 정작 복구가 필요한 순간에 통째로 실패한다.
-      const buf = readFileSync(p)
-      for (const raw of splitLines(buf)) {
-        const line = raw.toString('utf8')
-        if (!line.trim()) continue
-        let e: Record<string, unknown>
-        try {
-          e = JSON.parse(line) as Record<string, unknown>
-        } catch {
-          continue // 내려가는 순간 반쯤 쓰인 줄 — 그 줄만 버린다
-        }
-        if (e.op === 'add' && e.m && typeof e.m === 'object') {
-          const m = e.m as ChatMessage
-          if (!m.id) continue
-          if (seen.has(m.id)) {
-            // 이미 스냅샷에 있는 말이다. 그 앞에 밀려 있던 모르는 말들이 바로 이 자리 앞에 들어간다.
-            const i = room.messages.findIndex((x) => x.id === m.id)
-            if (i >= 0) {
-              placePending(i)
-              at = room.messages.findIndex((x) => x.id === m.id) + 1
-            }
-            continue
-          }
-          if (at === null) {
-            // 아직 기준점이 없다 — 아는 말을 만날 때까지 들고 있는다.
-            pending.push(m)
-          } else {
-            room.messages.splice(at, 0, m)
-            at++
-          }
-          seen.add(m.id)
-          applied++
-        } else if (e.op === 'edit' && typeof e.id === 'string') {
-          const m = room.messages.find((x) => x.id === e.id) ?? pending.find((x) => x.id === e.id)
-          if (m) {
-            m.text = typeof e.text === 'string' ? e.text : m.text
-            m.edited = true
-            applied++
-          }
-        } else if (e.op === 'del' && typeof e.id === 'string') {
-          deleted.add(e.id)
-          const i = room.messages.findIndex((x) => x.id === e.id)
-          if (i >= 0) {
-            room.messages.splice(i, 1)
-            if (at !== null && at > i) at--
-            applied++
-          } else {
-            const j = pending.findIndex((x) => x.id === e.id)
-            if (j >= 0) {
-              pending.splice(j, 1)
-              applied++
-            }
-          }
-        } else if (e.op === 'room') {
-          // 방 머리글 — 되살리기용이라 여기서는 넘긴다.
-          continue
-        } else if (e.op === 'clear') {
-          room.messages = []
-          seen.clear()
-          pending = []
-          at = 0
-          cleared = true
-          applied++
-        }
-      }
-      // 끝까지 아는 말을 못 만났다 = 기록장이 스냅샷 뒤에 이어지는 몫이다. 뒤에 붙인다.
-      placePending(room.messages.length)
-      this.evictOldest(room, MAX_HISTORY)
-    } catch (e) {
-      console.error(`[rooms] ${room.id} 대화 기록장 복구 실패:`, e)
-    }
-    return { applied, deleted, cleared }
+  const INLINE_AVATAR_KEEP = 4096 // 이 길이 이하는 그대로 통과(참조는 약 71자·작은 그림은 굳이 안 옮긴다)
+  // 계정 id → 방금 옮긴 프사(원본과 그 참조). 계정 파일에는 원본이 그대로 남으므로, 여기 적어 두지 않으면
+  // ① 목록을 부를 때마다 같은 그림을 다시 디코드해 해시하고 ② 아무도 안 가리키는 자산이라 6시간마다 도는
+  // 자산 회수가 조용히 지워 프사가 사라진다. listAvatarRefs 가 그 회수에게 '살아 있다'고 알려 준다.
+  const listedAvatars = new Map<string, { src: string; ref: string }>()
+  const listAvatar = async (id: string, v: string | undefined): Promise<string | undefined> => {
+    if (!v) return undefined
+    if (v.length <= INLINE_AVATAR_KEEP) return v
+    const memo = listedAvatars.get(id)
+    // 자산이 아직 있는지도 함께 본다 — 어떤 이유로든 그림이 사라지면 죽은 참조를 계속 돌려주는 대신
+    // 아래에서 다시 넣는다(안 그러면 그 사람 프사가 서버를 다시 켤 때까지 모두에게 깨져 보인다).
+    if (memo && memo.src === v && assets.resolve(memo.ref.slice('asset:'.length))) return memo.ref
+    const ref = await internalizeInlineImage(v)
+    if (ref.length > INLINE_AVATAR_KEEP) return undefined // 자산화 실패 — 봉우리를 만들지 않는다
+    listedAvatars.set(id, { src: v, ref })
+    return ref
+  }
+  /** 위에서 옮긴 프사 참조를 자산 회수의 보존 집합에 싣는다(index 의 GC 가 부른다). */
+  const listAvatarRefs = (into: Set<string>): void => {
+    for (const { ref } of listedAvatars.values()) into.add(ref.slice('asset:'.length))
   }
 
-  private loadAll(): void {
-    try {
-      if (!existsSync(this.roomDir)) return
-      for (const f of readdirSync(this.roomDir)) {
-        // 비상 사본은 본 저장본이 아니다 — 방으로 읽지 않고 아래에서 합치는 재료로만 쓴다.
-        if (!f.endsWith('.json') || f.endsWith('.rescue.json')) continue
-        try {
-          const room = roomFromFile(JSON.parse(readFileSync(join(this.roomDir, f), 'utf8')))
-          if (room) {
-            // 스냅샷 이후에 오간 말을 이어붙인다 — 지난번에 저장되지 못한 몫이 여기 남아 있다.
-            const back = this.replayJournal(room)
-            if (back.applied) console.log(`[rooms] ${room.title || room.id}: 저장되지 않았던 대화 ${back.applied}건 복구`)
-            // 기록장까지 놓친 말이 비상 사본에 남았을 수 있다(기록장 쓰기가 실패했던 방).
-            const extra = this.mergeRescue(room, back)
-            if (extra) {
-              this.saveLoss.set(room.id, `기록장이 놓친 대화 ${extra}건을 비상 사본에서 되살렸습니다`)
-              console.log(`[rooms] ${room.title || room.id}: 비상 사본에서 대화 ${extra}건 복구`)
-            }
-            this.rooms.set(room.id, room)
-            this.codeToId.set(room.code, room.id)
-            // 되살린 몫은 아직 스냅샷에 없다 — 저장 대상으로 표시해 다음 자동저장이 접어 넣게 한다.
-            // (그러지 않으면 그 방은 조용한 동안 영영 저장되지 않고 기록장만 계속 불어난다.)
-            this.savedAt.set(room.id, back.applied || extra ? 0 : room.lastActivityAt)
-          }
-        } catch (e) {
-          this.saveLoss.set(f.replace(/\.json$/, ''), `세션 파일을 읽지 못했습니다: ${String(e)}`)
-          console.error(`[rooms] ${f} 로드 실패:`, e)
-        }
-      }
-      // 세션 파일 없이 기록장만 남은 방 — 되살린다.
-      // (세션이 처음 저장되기 전에 서버가 내려갔거나, 디스크가 차 큰 저장만 계속 실패한 경우다.)
-      for (const f of readdirSync(this.roomDir)) {
-        if (!f.endsWith('.chat.jsonl')) continue
-        const id = f.slice(0, -'.chat.jsonl'.length)
-        if (this.rooms.has(id)) continue
-        // 비상 사본이 있으면 그쪽이 온전한 그릇이다(맵·자료까지 담고 있다). 없으면 머리글로 뼈대만 세운다.
-        const rescue = this.roomFromRescue(id)
-        const rebuilt = rescue && !this.codeToId.has(rescue.code) ? rescue : this.roomFromJournalHead(id)
-        if (!rebuilt) {
-          this.saveLoss.set(id, '세션 파일도 머리글도 없어 되살리지 못한 대화 기록이 남아 있습니다')
-          console.error(`[rooms] ${f}: 짝이 되는 세션 파일이 없습니다.`)
-          continue
-        }
-        const back = this.replayJournal(rebuilt)
-        if (rescue && rebuilt !== rescue) this.mergeRescue(rebuilt, back)
-        this.rooms.set(rebuilt.id, rebuilt)
-        this.codeToId.set(rebuilt.code, rebuilt.id)
-        this.savedAt.set(rebuilt.id, 0) // 아직 본 저장본이 없다 — 다음 자동저장이 반드시 쓰게
-        this.saveLoss.set(
-          id,
-          rescue
-            ? `세션 파일이 없어 비상 사본과 대화 기록으로 되살렸습니다(대화 ${back.applied}건 복구)`
-            : `세션 파일이 없어 대화 기록만으로 되살렸습니다(대화 ${back.applied}건 · 맵·자료는 복구 대상이 아닙니다)`
-        )
-        console.log(`[rooms] ${rebuilt.title || rebuilt.id}: 세션 파일 없이 대화 ${back.applied}건을 되살렸습니다.`)
-      }
-      // 기록장조차 없이 비상 사본만 남은 방 — 그것이라도 세운다.
-      for (const f of readdirSync(this.roomDir)) {
-        if (!f.endsWith('.rescue.json')) continue
-        const id = f.slice(0, -'.rescue.json'.length)
-        if (this.rooms.has(id)) continue
-        const room = this.roomFromRescue(id)
-        if (!room || this.codeToId.has(room.code)) {
-          // 조용히 넘어가면 그 방이 왜 사라졌는지 아무도 모른다 — 사실만은 남긴다.
-          this.saveLoss.set(id, '비상 사본만 남았는데 되살리지 못했습니다(손상되었거나 방 코드가 겹칩니다)')
-          continue
-        }
-        this.rooms.set(room.id, room)
-        this.codeToId.set(room.code, room.id)
-        this.savedAt.set(room.id, 0)
-        this.saveLoss.set(id, '본 저장본이 없어 비상 사본으로 되살렸습니다(덜어냈던 옛 대화는 복구하지 못했습니다)')
-        console.log(`[rooms] ${room.title || room.id}: 비상 사본으로 되살렸습니다.`)
-      }
-      console.log(`[rooms] 영속 세션 ${this.rooms.size}개 로드`)
-    } catch (e) {
-      console.error('[rooms] 로드 실패:', e)
+  const lightenAvatarPool = async (snap: RoomState): Promise<RoomState> => {
+    const pool = snap.avatarPool
+    if (Array.isArray(pool) && pool.length) {
+      snap.avatarPool = await Promise.all(pool.map(internalizeInlineImage))
     }
+    return snap
   }
 
+  // origin 허용 판정: 화이트리스트 미설정이면 전체. Origin 없음(Electron/네이티브)은 항상 허용.
+  const originAllowed = (origin: string | undefined): boolean =>
+    !corsOrigins || !origin || corsOrigins.includes(origin)
+  // CORS 응답 헤더값: 화이트리스트면 일치 origin 만 에코(아니면 첫 항목), 미설정이면 '*'.
+  const corsHeaderValue = (origin: string | undefined): string =>
+    !corsOrigins ? '*' : origin && corsOrigins.includes(origin) ? origin : (corsOrigins[0] ?? '*')
+
+  const JSON_H = { 'content-type': 'application/json' } as const
   /**
-   * 방 1개 파일 저장(원자적 tmp→rename). 직렬화는 동기로 '그 시점 상태'를 캡처하고, 디스크 I/O 는 비동기로 처리한다.
-   * 동기 직렬화 후 비동기 쓰기로 이벤트 루프 블로킹을 피한다.
-   * flushing 가드로 이전 쓰기가 끝나기 전 같은 방을 다시 쓰지 않게 한다(겹쳐쓰기·tmp 경합 방지).
+   * POST 본문을 읽어 라우트에 넘긴다. 라우트가 던진 예외는 여기서 받아 그 요청만 500 으로 끝낸다.
+   *
+   * 받아 주는 곳이 없으면 요청 하나의 예외가 미처리 거부가 되어 프로세스째 내려가고, 그 서버에 붙어
+   * 있던 사람이 전부 함께 끊긴다. 서버 파일이 서로 다른 판으로 섞였을 때가 대표적이라, 안내 문구에
+   * 프로그램 최신 여부를 확인하라는 말을 함께 담는다.
    */
-  private flush(room: Room): Promise<void> {
-    if (!this.persist) return Promise.resolve()
-    // 지워진 방은 쓰지 않는다 — 예약된 뒤따라 쓰기가 삭제 뒤에 도착하면 지운 파일이 되살아난다.
-    if (!this.rooms.has(room.id)) return Promise.resolve()
-    const inFlight = this.flushing.get(room.id)
-    if (inFlight) {
-      // 앞선 쓰기가 아직 안 끝났다. 볼륨이 매달리면 이 표시가 영영 안 풀려 그 방만 조용히 저장을 멈춘다 —
-      // 서버가 도는 동안에는 아무 티도 안 나다가 재시작하는 순간 그 사이 대화가 사라진다.
-      // 오래 걸리면 알려서, 적어도 눈에는 띄게 한다(대화 자체는 기록장이 지킨다).
-      const since = this.flushStartedAt.get(room.id) ?? 0
-      if (since && Date.now() - since > STUCK_FLUSH_MS) {
-        this.saveTrouble.set(room.id, `저장이 ${Math.round((Date.now() - since) / 1000)}초째 끝나지 않습니다(디스크 확인 필요)`)
-      }
-      // 지금 상태를 그냥 버리면 안 된다 — 진행 중인 쓰기는 그보다 옛 상태를 담고 있다.
-      // 끝나는 대로 한 번 더 쓰도록 이어 붙인다(예약은 하나면 족하다).
-      if (!this.queued.has(room.id)) {
-        this.queued.add(room.id)
-        return inFlight.then(() => {
-          this.queued.delete(room.id)
-          return this.flush(room)
-        })
-      }
-      // 진행 중인 쓰기를 그대로 돌려준다 — 버리면 종료 때 '다 저장했다'는 거짓말이 된다.
-      return inFlight
+  const failRoute = (req: IncomingMessage, res: ServerResponse, e: unknown): void => {
+    console.error('[http] 라우트 오류:', req.url, e)
+    // 이미 응답을 시작한 뒤에 터졌으면 헤더를 다시 쓸 수 없다 — 연결만 정리한다.
+    if (res.headersSent) {
+      res.end()
+      return
     }
-    let json: string
-    let at: number
-    /** 이번 저장이 오래된 대화를 덜어낸 반쪽인가 — 그렇다면 기록장·본 저장본을 건드리면 안 된다. */
-    let trimmedSave = false
+    res.writeHead(500, JSON_H)
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: '서버가 이 요청을 처리하지 못했습니다. 서버 프로그램이 최신인지 확인해 주세요.'
+      })
+    )
+  }
+  const withBody = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    run: (body: Record<string, unknown>) => void | Promise<void>
+  ): void => {
+    void readJsonBody(req)
+      .then(run)
+      .catch((e: unknown) => failRoute(req, res, e))
+  }
+  /**
+   * 파일처럼 통째로 받는 본문(이미지·묶음 가져오기)용 창구. 그물의 뜻은 withBody 와 같다.
+   * 답을 못 준 채로 끝나면 부르는 쪽은 시간 제한이 없어 영영 기다린다 — 실패도 반드시 응답으로 끝낸다.
+   */
+  const withRawBody = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    maxBytes: number,
+    run: (buf: Buffer | null) => void | Promise<void>
+  ): void => {
+    void readRawBody(req, maxBytes)
+      .then(run)
+      .catch((e: unknown) => failRoute(req, res, e))
+  }
+  /** 관리자 전용 엔드포인트 게이트 — 본문 token 이 admin 이면 그 계정, 아니면 401/403 응답 후 null. */
+  const requireAdmin = (body: Record<string, unknown>, res: ServerResponse): PublicAccount | null => {
+    const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+    if (!account) {
+      res.writeHead(401, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+      return null
+    }
+    if (account.role !== 'admin') {
+      res.writeHead(403, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '권한이 없습니다.' }))
+      return null
+    }
+    return account
+  }
+  /**
+   * 비공개 계정 게이트 — 그 사람의 로비·블로그·세션 로그·방명록·마이룸을 내주기 전에 부른다.
+   *
+   * 볼 수 있으면 false 를 돌려주고 아무것도 쓰지 않는다. 못 보면 403 을 쓰고 true 를 돌려주므로
+   * 호출부는 `if (lobbyLocked(...)) return` 한 줄이면 된다. locked 표시를 함께 실어, 클라이언트가
+   * '없는 사람'과 '잠긴 사람'을 갈라 자물쇠 화면을 그릴 수 있게 한다.
+   */
+  const lobbyLocked = (res: ServerResponse, viewerId: string | null, ownerId: string): boolean => {
+    if (auth.canViewLobby(viewerId, ownerId)) return false
+    res.writeHead(403, JSON_H)
+    res.end(JSON.stringify({ ok: false, locked: true, error: '비공개 계정입니다. 친구만 볼 수 있어요.' }))
+    return true
+  }
+  /** Authorization: Bearer 헤더의 열람자 계정 id — 없거나 무효면 null(비로그인 열람). */
+  const bearerViewerId = (req: IncomingMessage): string | null => {
+    const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+    if (!authz.startsWith('Bearer ')) return null
+    return auth.verifyToken(authz.slice(7))?.id ?? null
+  }
+  /** member 이상 게이트(도트타운 경제 — 알바·구매·일일). 손님은 403. */
+  const requireMember = (body: Record<string, unknown>, res: ServerResponse): PublicAccount | null => {
+    const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+    if (!account) {
+      res.writeHead(401, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+      return null
+    }
+    if (account.role === 'guest') {
+      res.writeHead(403, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '손님 계정은 이용할 수 없습니다(관리자 승인 후).' }))
+      return null
+    }
+    return account
+  }
+  /** 경제 라우트 레이트리밋 — 계정당 10초 30건. 초과 시 429 후 true(쓰기 유발 전에 차단). */
+  const econLimited = (accountId: string, res: ServerResponse): boolean => {
+    const t = Date.now()
+    const rl = econRate.get(accountId)
+    if (!rl || t > rl.resetAt) {
+      econRate.set(accountId, { count: 1, resetAt: t + 10_000 })
+      return false
+    }
+    if (rl.count >= 30) {
+      res.writeHead(429, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '너무 자주 요청했어요. 잠시 후 다시 시도하세요.' }))
+      return true
+    }
+    rl.count++
+    return false
+  }
+  /** 소셜 라우트 레이트리밋 — 계정당 10초 40건(좋아요/방문/방명록). 초과 시 429 후 true. */
+  const socialLimited = (accountId: string, res: ServerResponse): boolean => {
+    const t = Date.now()
+    const rl = socialRate.get(accountId)
+    if (!rl || t > rl.resetAt) {
+      socialRate.set(accountId, { count: 1, resetAt: t + 10_000 })
+      return false
+    }
+    if (rl.count >= 40) {
+      res.writeHead(429, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '너무 자주 요청했어요. 잠시 후 다시 시도하세요.' }))
+      return true
+    }
+    rl.count++
+    return false
+  }
+  /**
+   * DM 조회 레이트리밋 — 계정당 10초 60건(목록·대화·열람표시). 초과 시 429 후 true.
+   *
+   * 대화창을 한 번 열 때마다 세 건이 함께 나간다. 사람 손으로는 닿지 않는 수지만, 클라가 어딘가에서
+   * 되풀이에 빠지면 이 셋이 초당 수백 건이 되고 서버는 그 한 사람 때문에 모두에게 느려진다.
+   * 보내기(dmRate)와 버킷을 나눠, 조회가 몰려도 대화를 못 보내게 되지는 않게 한다.
+   */
+  const dmReadLimited = (accountId: string, res: ServerResponse): boolean => {
+    const t = Date.now()
+    const rl = dmReadRate.get(accountId)
+    if (!rl || t > rl.resetAt) {
+      dmReadRate.set(accountId, { count: 1, resetAt: t + 10_000 })
+      return false
+    }
+    if (rl.count >= 60) {
+      res.writeHead(429, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '너무 자주 요청했어요. 잠시 후 다시 시도하세요.' }))
+      return true
+    }
+    rl.count++
+    return false
+  }
+  /**
+   * DM 1:1 상대가 실재하는 계정인지. 아무 문자열이나 통과시키면 그 문자열이 그대로 대화 이름이 되어
+   * 저장소에 눌러앉는다 — 요청 몇 번이면 서버 메모리가 통째로 차고, 그러면 접속해 있던 사람이 전부 끊긴다.
+   * 보내기(/dm/send)에는 이미 있는 확인을 읽기·수정 쪽에도 맞춘다.
+   */
+  const validPeer = (peer: string): boolean => peer.length > 0 && peer.length <= 64 && !!auth.getHome(peer)
+
+  /** 이름을 문자열로 받는 브로드캐스트 — 커뮤니티 라우트 표가 이벤트를 값으로 다루기 때문에 필요하다. */
+  const emitRaw = (room: string, event: string, payload: unknown): void => {
+    ;(io.to(room) as unknown as { emit: (e: string, p: unknown) => void }).emit(event, payload)
+  }
+
+  // ── 커뮤니티 경제 ──────────────────────────────────────────────────────
+  // 지갑·소지품은 캐릭터 저장소 위에 얹힌다(같은 파일 안이라 한 번의 쓰기로 끝난다).
+  const cmtyEcon =
+    opts?.cmtyEcon ??
+    createCommunityEcon({
+      community,
+      chars: cmtyChars,
+      catalog: cmtyCatalog,
+      ledger: cmtyLedger,
+      gifts: cmtyGifts,
+      persist: false
+    })
+  // 경제 알림은 사람이 한 일이 아닌 경우가 많아, 액터를 커뮤니티 자체로 둔다.
+  cmtyEcon.setNotify((accountId, text, ref) =>
+    notify(accountId, {
+      kind: 'cmty',
+      actor: { id: '', name: community.settings()?.name || '커뮤니티' },
+      ...(ref ? { ref } : {}),
+      text
+    } as NotifInput)
+  )
+  // 퀘스트·조사 — 진행 상태는 캐릭터 샤드 안에 있어 보상 지급이 한 번의 쓰기로 끝난다.
+  const cmtyQuest = opts?.cmtyQuest ?? createCommunityQuest({ chars: cmtyChars, games: cmtyGames, econ: cmtyEcon, catalog: cmtyCatalog })
+  const cmtySurvey = opts?.cmtySurvey ?? createCommunitySurvey({ chars: cmtyChars, games: cmtyGames, econ: cmtyEcon, catalog: cmtyCatalog })
+  cmtyQuest.setNotify((accountId, text, ref) =>
+    notify(accountId, {
+      kind: 'cmty',
+      actor: { id: '', name: community.settings()?.name || '커뮤니티' },
+      ...(ref ? { ref } : {}),
+      text
+    } as NotifInput)
+  )
+  // 재시작 사이에 끝난 파견을 확정하고, 아직 알리지 않은 것을 한 번에 알린다.
+  cmtyQuest.tick(Date.now())
+  // 도감의 획득처 탭이 퀘스트·조사까지 훑도록 이어 준다.
+  cmtyCatalog.addSourceProvider((defId) =>
+    cmtyGames.sourcesOf(defId).map((x) => ({ kind: x.kind, id: x.id, name: x.name, chance: x.chance, qty: x.qty }))
+  )
+
+  // 기한이 지난 선물은 보낸 사람에게 돌아간다. 부팅 직후 한 번, 그 뒤로는 한 시간에 한 번.
+  cmtyEcon.sweepGifts(Date.now())
+  const giftSweeper = setInterval(() => cmtyEcon.sweepGifts(Date.now()), 60 * 60 * 1000)
+  giftSweeper.unref?.()
+
+  // 삭제함의 보관 기한(30일)이 지난 글을 실제로 지운다. 화면은 이 약속을 이미 안내하고 있다.
+  cmtyPosts.purgeExpired(Date.now())
+  const trashSweeper = setInterval(() => cmtyPosts.purgeExpired(Date.now()), 6 * 60 * 60 * 1000)
+  trashSweeper.unref?.()
+
+  // ── 커뮤니티 라우트 ────────────────────────────────────────────────────
+  // 백 개 남짓이라 별도 모듈의 표로 두고 여기서는 배선만 한다(각 항목이 필요한 권한을 자기 옆에 적는다).
+  const communityRoutes = createCommunityRoutes({
+    auth,
+    community,
+    posts: cmtyPosts,
+    chars: cmtyChars,
+    catalog: cmtyCatalog,
+    econ: cmtyEcon,
+    ledger: cmtyLedger,
+    gifts: cmtyGifts,
+    games: cmtyGames,
+    quest: cmtyQuest,
+    survey: cmtySurvey,
+    readJsonBody,
+    notify: (ownerId, item) => notify(ownerId, item as NotifInput),
+    actorOf,
+    // 이벤트 이름을 문자열로 받아 넘기므로 여기서 한 번만 넓힌다. 이름·페이로드 계약 자체는 protocol 이 강제한다.
+    emitTo: (room, event, payload) => emitRaw(room, event, payload),
+    emitAccount: (accountId, event, payload) => emitRaw('acct:' + accountId, event, payload),
+    socialLimited,
+    econLimited,
+    now: () => Date.now()
+  })
+
+  // ── 웹 클라이언트(웹판) 정적 서빙 ──────────────────────────────────────
+  // webRoot 지정 시 미매칭 GET/HEAD 를 이 폴더의 '실존 파일'로만 응답한다. 미존재 경로는 핸들러 끝의
+  // 404 JSON 으로 흘려보내 '구버전 서버 감지' 신호를 보존한다(웹판엔 SPA 라우터가 없어 폴백 불필요).
+  const webRoot = opts?.webRoot || null
+  /**
+   * 웹판 문서(HTML)에만 붙이는 콘텐츠 보안 정책 — 주입된 스크립트가 실행되는 길을 막는 2차 방어선이다.
+   * 각 항목이 넓은 이유:
+   *   img/media/connect — 접속할 호스트를 사용자가 직접 입력하므로 대상 오리진을 미리 알 수 없다.
+   *   connect 의 data:·blob: — 자산 업로드가 data URL 을 fetch 해 blob 으로 바꾼 뒤 올린다. '*' 는 이 두 스킴을
+   *     포함하지 않으므로 빠뜨리면 웹판에서 이미지·음원 업로드가 전부 실패한다.
+   *   style 'unsafe-inline' — 글 본문이 인라인 style 로 서식을 표현한다(새니타이저가 허용하는 유일한 속성).
+   *   worker blob: — 움짤 리사이즈 워커가 blob URL 로 뜬다.
+   *   영상 임베드 호스트 — 배경음악 재생용 프레임.
+   * 값을 넓혀야 할 일이 생기면, 넓히기 전에 그 기능이 정말 그 권한을 필요로 하는지 먼저 확인한다.
+   */
+  const WEB_CSP = [
+    "default-src 'self'",
+    // blob: — 확장팩(.tkext)을 이 브라우저에 설치해 쓰는 길. 사람이 고른 파일을 풀어 blob 주소로
+    // 실행한다. eval 을 여는 것(unsafe-eval)과 다르다 — 이미 우리 코드가 돌고 있어야만 만들 수 있는
+    // 주소라, 밖에서 밀어 넣은 글이 코드가 되는 길은 열리지 않는다.
+    "script-src 'self' blob: https://www.youtube.com",
+    "style-src 'self' 'unsafe-inline'",
+    'img-src * data: blob:',
+    'media-src * data: blob:',
+    "font-src 'self' data: blob:", // 확장팩이 제 글꼴을 함께 담아 오는 경우
+    'connect-src * data: blob:',
+    "worker-src 'self' blob:",
+    "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'none'"
+  ].join('; ')
+  const WEB_MIME: Record<string, string> = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.ico': 'image/x-icon',
+    '.json': 'application/json; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+    '.map': 'application/json',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+    '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg',
+    '.wasm': 'application/wasm'
+  }
+  /** 요청 경로를 webRoot 안의 실존 파일로 해석(경로 탈출 차단·허용 확장자만). 파일이 아니면 null. */
+  const resolveWebFile = (
+    rawUrl: string
+  ): { path: string; rel: string; type: string; size: number; etag: string } | null => {
+    if (!webRoot) return null
+    let p = rawUrl.split(/[?#]/)[0]
     try {
-      at = room.lastActivityAt
-      json = JSON.stringify(roomToFile(room)) // 동기 직렬화 — 일관 스냅샷 캡처(이후 방이 바뀌어도 안전)
-    } catch (e) {
-      // 방이 너무 커져 문자열로 못 만드는 지경(오래된 방의 본문 박힌 이미지 등). 여기서 포기하면
-      // 그 방은 이후 한 번도 저장되지 않고, 재시작하는 순간 마지막 저장 이후의 대화가 통째로 사라진다.
-      // 그래서 최근 대화만 남겨서라도 반드시 저장한다 — 오래된 앞부분을 잃는 편이 뒷부분을 다 잃는 것보다 낫다.
-      const kept = this.serializeTrimmed(room)
-      if (!kept) {
-        this.saveTrouble.set(room.id, `직렬화 실패: ${String(e)}`)
-        console.error(`[rooms] ${room.id}(${room.title}) 직렬화 실패. 줄여서도 저장하지 못했다:`, e)
-        return Promise.resolve()
-      }
-      this.saveTrouble.set(
-        room.id,
-        `방이 너무 커서 온전한 저장이 실패했습니다. 대화는 이전 저장본·기록장·비상 사본으로 지키는 중입니다`
-      )
-      console.error(`[rooms] ${room.id}(${room.title}) 너무 큼. 최근 대화 스냅샷을 비상 사본에 둔다(덜어낸 ${kept.dropped}개는 이전 저장본과 기록장 몫).`)
-      json = kept.json
-      at = room.lastActivityAt
-      trimmedSave = true
+      p = decodeURIComponent(p)
+    } catch {
+      return null // 잘못된 % 인코딩
     }
-    this.flushStartedAt.set(room.id, Date.now())
-    // 이 스냅샷이 담아낸 지점 — 저장이 끝난 뒤 여기까지만 덜어낸다(그 사이 들어온 말은 남긴다).
-    // 반쪽 저장이면 0 — 스냅샷이 담지 못한 대화의 유일한 사본이 기록장이므로 한 줄도 지우지 않는다.
-    const cut = trimmedSave ? 0 : this.journalSize(room.id)
-    // 반쪽 저장은 본 저장본을 덮지 않는다. 이전 온전 스냅샷은 기록장이 이미 덜어낸(그래서 다른 사본이 없는)
-    // 옛 대화의 유일한 그릇이라, 반쪽으로 덮는 순간 그 대화가 디스크에서 사라진다. 비상 사본에 따로 둔다.
-    const f = trimmedSave ? this.rescuePath(room.id) : join(this.roomDir, room.id + '.json')
-    const tmp = f + '.tmp'
-    const work = (async () => {
-      try {
-        await mkdir(this.roomDir, { recursive: true })
-        await writeFile(tmp, json, 'utf8')
-        await rename(tmp, f)
-        // 쓰는 사이 방이 지워졌으면 방금 쓴 파일도 걷는다 — 지운 방이 다음 기동에서 되살아나지 않게.
-        if (!this.rooms.has(room.id)) {
-          try {
-            await unlink(f)
-          } catch {
-            /* 이미 걷혔으면 그만 */
-          }
+    if (p === '/') p = '/index.html'
+    // 경로 탈출 차단: 역슬래시·널문자·'..'/빈 세그먼트 금지 + 최종 경로가 webRoot 안인지 재확인.
+    if (!p.startsWith('/') || p.includes('\\') || p.includes('\0')) return null
+    if (p.slice(1).split('/').some((seg) => seg === '..' || seg === '')) return null
+    const abs = join(webRoot, p.slice(1))
+    const rel = relative(webRoot, abs)
+    if (!rel || rel.startsWith('..')) return null
+    const dot = abs.lastIndexOf('.')
+    const type = dot >= 0 ? WEB_MIME[abs.slice(dot).toLowerCase()] : undefined
+    if (!type) return null
+    try {
+      const st = statSync(abs)
+      if (!st.isFile()) return null
+      // 약검증자 ETag(크기+수정시각) — no-cache 파일의 재검증이 매번 전체 재전송이 아니라 304 로 끝나게.
+      const etag = `W/"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`
+      return { path: abs, rel, type, size: st.size, etag }
+    } catch {
+      return null // 미존재 — 404 JSON 폴백
+    }
+  }
+
+  const handler = (req: IncomingMessage, res: ServerResponse): void => {
+    // CORS: 프리뷰(다른 포트)·Electron(file://)에서 fetch 로 로그인/회원가입 허용.
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined
+    res.setHeader('Access-Control-Allow-Origin', corsHeaderValue(origin))
+    res.setHeader('Vary', 'Origin')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    // 'authorization' 필수 — POST /asset 은 Bearer 토큰을 헤더로 보낸다. 빠지면 렌더러(app:// origin)의 업로드가
+    // CORS 프리플라이트(OPTIONS)에서 막혀 전부 실패한다.
+    res.setHeader('Access-Control-Allow-Headers', 'content-type, authorization')
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+    if (req.url === '/health') {
+      // data: 'fresh'=이번 기동이 빈 데이터 폴더에서 시작(볼륨 미부착 의심) · 'used'=쓰던 폴더.
+      const data = opts?.dataFresh === true ? 'fresh' : 'used'
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, ver: SERVER_VERSION, rooms: store.roomCount, data }))
+      return
+    }
+    // 자산 서빙(GET /asset/<sha256>) — 콘텐츠 주소(불변)라 영구 캐시. 해시가 곧 캐퍼빌리티이므로 인증 없이 제공.
+    // 콘텐츠 주소(불변)라 ETag=해시(강한 검증자) + If-None-Match 304 로 재검증을 짧게 끝내고,
+    // Range(206) 부분전송으로 오디오 시크·부분요청이 매번 전곡을 재전송하지 않게 한다(egress 절감).
+    if (req.method === 'GET' && req.url && req.url.startsWith('/asset/')) {
+      const hash = req.url.slice('/asset/'.length).split(/[?#]/)[0]
+      const a = assets.resolve(hash)
+      if (!a) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      // 크기: 영속이면 파일 stat, 인메모리면 바이트 길이. stat 실패(직전 sweep 등)는 404 로 폴백.
+      let size: number
+      if (a.path) {
+        try {
+          size = statSync(a.path).size
+        } catch {
+          res.writeHead(404)
+          res.end()
           return
         }
-        // 반쪽 저장은 '다 저장했다'가 아니다 — 다음 주기에 온전한 저장을 다시 노린다.
-        if (!trimmedSave) {
-          this.savedAt.set(room.id, at)
-          // 비상 사본부터 걷는다. 기록장을 먼저 비우면, 그 사이 죽었을 때 '지웠다'는 기록 없는
-          // 낡은 사본만 남아 다음 기동에서 지운 말이 되살아난다. 사본을 못 걷었으면 기록장도 남긴다.
-          let rescueGone = true
-          if (existsSync(this.rescuePath(room.id))) {
-            try {
-              await unlink(this.rescuePath(room.id))
-            } catch (e) {
-              rescueGone = false
-              this.saveTrouble.set(room.id, `비상 사본 정리 실패: ${String(e)}`)
+      } else {
+        size = a.bytes ? a.bytes.length : 0
+      }
+      const etag = '"' + hash + '"'
+      res.setHeader('content-type', a.mime)
+      // 업로드 자산은 사용자 콘텐츠라 브라우저 MIME 스니핑을 막아 선언된 타입으로만 처리(HTML 폴리글롯 방어).
+      res.setHeader('x-content-type-options', 'nosniff')
+      // 자산은 API·웹판과 같은 오리진에서 나가므로, 혹시라도 문서로 해석되면 그 오리진의 저장소(로그인 토큰)에 닿는다.
+      // 아래 둘로 '문서로 열리는 길' 자체를 막는다. 화면 표시는 <img>/<audio> 같은 하위 리소스 로드라 영향받지 않는다.
+      //   - attachment: 주소창으로 직접 열면 표시 대신 내려받기가 된다.
+      //   - sandbox: 그래도 문서로 열렸을 때 스크립트·같은 오리진 권한을 모두 뗀다.
+      res.setHeader('content-disposition', 'attachment')
+      res.setHeader('content-security-policy', 'sandbox')
+      res.setHeader('cache-control', 'public, max-age=31536000, immutable')
+      res.setHeader('etag', etag)
+      res.setHeader('accept-ranges', 'bytes')
+      // 조건부요청 — ETag 일치(또는 *)면 304(본문 없음).
+      const inm = req.headers['if-none-match']
+      if (typeof inm === 'string' && inm.split(',').some((t) => {
+        const v = t.trim()
+        return v === etag || v === 'W/' + etag || v === '*'
+      })) {
+        res.writeHead(304)
+        res.end()
+        return
+      }
+      // Range 파싱 — 'bytes=start-end' 단일 구간만(멀티파트 미지원). 인식 못 하면 전체 200 폴백.
+      let start = 0
+      let end = size - 1
+      let partial = false
+      const rangeH = req.headers['range']
+      if (typeof rangeH === 'string' && size > 0) {
+        const m = /^bytes=(\d*)-(\d*)$/.exec(rangeH.trim())
+        if (m && (m[1] !== '' || m[2] !== '')) {
+          if (m[1] === '') {
+            // suffix: 마지막 N 바이트.
+            const n = parseInt(m[2], 10)
+            if (Number.isFinite(n) && n > 0) {
+              start = Math.max(0, size - n)
+              end = size - 1
+              partial = true
+            }
+          } else {
+            start = parseInt(m[1], 10)
+            end = m[2] === '' ? size - 1 : parseInt(m[2], 10)
+            if (end > size - 1) end = size - 1
+            partial = true
+          }
+          if (partial && (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size)) {
+            // 416 — 범위 불만족.
+            res.setHeader('content-range', `bytes */${size}`)
+            res.writeHead(416)
+            res.end()
+            return
+          }
+        }
+      }
+      if (partial) {
+        res.setHeader('content-range', `bytes ${start}-${end}/${size}`)
+        res.setHeader('content-length', String(end - start + 1))
+        res.writeHead(206)
+        if (a.path) {
+          const stream = createReadStream(a.path, { start, end })
+          stream.on('error', () => res.end()) // 헤더는 이미 전송(206) — 종료만.
+          stream.pipe(res)
+        } else {
+          res.end(a.bytes ? a.bytes.subarray(start, end + 1) : undefined)
+        }
+        return
+      }
+      res.setHeader('content-length', String(size))
+      res.writeHead(200)
+      if (a.path) {
+        const stream = createReadStream(a.path)
+        stream.on('error', () => {
+          if (!res.headersSent) res.writeHead(404)
+          res.end()
+        })
+        stream.pipe(res)
+      } else {
+        res.end(a.bytes)
+      }
+      return
+    }
+    // 자산 업로드(POST /asset) — 바이너리 본문 + content-type. 인증 모드면 유효 토큰 필요(익명 디스크 채우기 방지).
+    // 반환: { ok, ref: 'asset:<해시>' }. 콘텐츠 해시라 같은 파일 재업로드는 중복 제거됨.
+    if (req.method === 'POST' && req.url === '/asset') {
+      if (requireAuth) {
+        const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+        const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+        if (!auth.verifyToken(token)) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+      }
+      withRawBody(req, res, assets.maxBytes, async (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '파일이 비었거나 너무 큽니다.' }))
+          return
+        }
+        const mime =
+          typeof req.headers['content-type'] === 'string'
+            ? req.headers['content-type']
+            : 'application/octet-stream'
+        try {
+          const hash = await assets.put(buf, mime)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, ref: 'asset:' + hash }))
+        } catch {
+          res.writeHead(500, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '자산 저장 실패' }))
+        }
+      })
+      return
+    }
+    // 인증: 소켓 연결 전 토큰 발급(회원가입/로그인).
+    if (req.method === 'POST' && (req.url === '/auth/signup' || req.url === '/auth/login')) {
+      withBody(req, res, (body) => {
+        const username = typeof body.username === 'string' ? body.username : ''
+        const password = typeof body.password === 'string' ? body.password : ''
+        const result =
+          req.url === '/auth/signup' ? auth.signup(username, password) : auth.login(username, password)
+        // 새로 가입한 사람은 손님이라 승인 전에는 세션을 열 수 없다. 관리자에게 알려 승인이 밀리지 않게 한다
+        // (첫 가입자는 자기 자신이 관리자가 되므로 notif.push 의 자기알림 차단에 걸려 no-op).
+        if (req.url === '/auth/signup' && result.ok) {
+          const who = result.account
+          for (const adminId of auth.adminIds())
+            notify(adminId, {
+              kind: 'signup',
+              actor: { id: who.id, name: who.nickname || who.username },
+              text: '가입했어요'
+            })
+        }
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 세션 재개 — 저장해 둔 토큰으로 계정을 되살린다(웹판 새로고침이 재로그인이 되지 않게).
+    // 토큰은 Authorization: Bearer 로만 받는다(주소에 싣지 않는다). 유효하면 로그인과 같은 공개 계정을 준다.
+    if (req.method === 'GET' && req.url === '/auth/me') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const account = token ? auth.verifyToken(token) : null
+      res.writeHead(account ? 200 : 401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(account ? { ok: true, account } : { ok: false, error: '로그인이 필요합니다.' }))
+      return
+    }
+    // 프로필 갱신(닉네임·사진·소개) — 토큰 인증. 본문에 token + 부분 패치.
+    if (req.method === 'POST' && req.url === '/auth/profile') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        // 손님은 프로필 색 테마(꾸밈)만 못 바꾼다 — 프사·헤더·닉네임·소개·링크는 허용.
+        const isGuest = auth.verifyToken(token)?.role === 'guest'
+        const result = auth.updateProfile(token, {
+          nickname: typeof body.nickname === 'string' ? body.nickname : undefined,
+          avatar: typeof body.avatar === 'string' ? body.avatar : undefined,
+          bio: typeof body.bio === 'string' ? body.bio : undefined,
+          banner: typeof body.banner === 'string' ? body.banner : undefined,
+          links: Array.isArray(body.links) ? body.links : undefined,
+          profileTheme:
+            !isGuest && body.profileTheme !== undefined ? (body.profileTheme as ProfileTheme) : undefined, // updateProfile 가 sanitizeTheme 로 재검증
+          // 로비 비공개는 등급과 무관하게 누구나 — 자기 사생활을 닫는 설정이라 손님도 막지 않는다.
+          lobbyPrivate: typeof body.lobbyPrivate === 'boolean' ? body.lobbyPrivate : undefined
+        })
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 비밀번호 변경(본인) — 토큰 + 현재 비밀번호 재확인. 성공 시 이 세션만 남고 다른 기기 세션은 끊긴다.
+    if (req.method === 'POST' && req.url === '/auth/password') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const current = typeof body.current === 'string' ? body.current : ''
+        const next = typeof body.next === 'string' ? body.next : ''
+        const result = auth.changePassword(token, current, next)
+        if (result.ok) {
+          // 끊긴 세션으로 붙어 있던 소켓은 살아 있어도 토큰이 무효다 — 즉시 끊어 재로그인시킨다.
+          for (const s of io.sockets.sockets.values()) {
+            const hs = s.handshake.auth as { token?: unknown }
+            if (s.data.account?.id === result.accountId && hs?.token !== token) s.disconnect(true)
+          }
+        }
+        res.writeHead(result.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 관리자 이양 — 지금 관리자가 다른 계정에 관리자를 넘기고 본인은 멤버가 된다(관리자는 항상 1명).
+    if (req.method === 'POST' && req.url === '/admin/transfer') {
+      withBody(req, res, (body) => {
+        const me = requireAdmin(body, res)
+        if (!me) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const result = auth.transferAdmin(me.id, userId)
+        if (!result.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(result))
+          return
+        }
+        // 양쪽 접속 세션에 새 등급을 즉시 반영(재로그인 없이 관리 화면이 열리고 닫히도록).
+        for (const s of io.sockets.sockets.values()) {
+          if (s.data.account?.id === result.to.id) {
+            s.data.account.role = 'admin'
+            s.emit('role:changed', { role: 'admin' })
+          } else if (s.data.account?.id === result.from.id) {
+            s.data.account.role = 'member'
+            s.emit('role:changed', { role: 'member' })
+          }
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 계정 탈퇴 — 토큰 + 비밀번호 재확인. 성공 시 계정·세션·방명록 제거 후 캐릭터·DM·소유 세션방을 연쇄 정리.
+    if (req.method === 'POST' && req.url === '/auth/delete') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const password = typeof body.password === 'string' ? body.password : ''
+        const result = auth.deleteAccount(token, password)
+        if (!result.ok) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(result))
+          return
+        }
+        const accountId = result.accountId
+        for (const fid of result.affectedFriends) io.to('user:' + fid).emit('friend:update') // (전)친구 목록 갱신
+        // 연쇄 정리: 캐릭터·DM·블로그·소유 세션방(고아 자산은 이후 자산 GC 가 회수).
+        characters.removeAll(accountId)
+        posts.removeAll(accountId) // 블로그 글·게시판 + 타인 글에 남긴 댓글/좋아요 제거
+        sessionlogs.removeAll(accountId) // 세션 로그·게시판 제거
+        dottown.removeAll(accountId) // 도트타운 마이룸·캐릭터 외형 제거
+        economy.removeAll(accountId) // 도트타운 지갑·원장·소유·알바·일일 제거
+        market.removeAll(accountId) // 도트타운 마켓 등록·보유 제거
+        community.removeAll(accountId) // 커뮤니티 멤버십(글·댓글은 남긴다)
+        cmtyPosts.removeAll(accountId) // 커뮤니티 좋아요·신고 회수
+        cmtyChars.removeAll(accountId, Date.now()) // 커뮤니티 캐릭터를 보관 상태로(지갑·소지품은 그대로 남는다)
+        estate.removeAll(accountId) // 광장 부동산(소유 건물) 제거
+        broadcastLots()
+        notif.removeForUser(accountId) // 알림 피드 제거(고아 파일 방지)
+        dmRate.delete(accountId) // DM 레이트리밋 항목 정리(계정 소멸)
+        dmReadRate.delete(accountId)
+        econRate.delete(accountId) // 경제 레이트리밋 항목 정리
+        socialRate.delete(accountId) // 소셜 레이트리밋 항목 정리
+        shownStatus.delete(accountId) // 프레즌스 표시 상태 정리
+        // DM 상대에게 사라진 대화 정리 신호 — by=상대 로 보내 그 사람 본인이 지운 것처럼 receiveClear→applyClear 실행(온라인 시 즉시 목록에서 제거).
+        for (const peer of dm.removeForUser(accountId)) {
+          io.to('user:' + peer).emit('dm:cleared', { peer: accountId, by: peer })
+        }
+        // 그룹 DM 은 파일 삭제가 아니라 멤버 제거(잔존 멤버 대화 보존). 잔존 멤버에게 재조회 신호.
+        for (const g of dm.leaveAllGroups(accountId)) {
+          for (const m of g.remaining) io.to('user:' + m).emit('dm:group:update', { threadId: g.threadId })
+        }
+        for (const room of store.deleteOwnedBy(accountId)) {
+          for (const pid of room.participants) {
+            io.to('user:' + pid).emit('room:closed', '세션이 삭제되었습니다.')
+            void io.in('user:' + pid).socketsLeave(room.id)
+          }
+        }
+        // 탈퇴 계정 본인의 열린 소켓 강제 종료 — disconnect 핸들러가 프레즌스·레이트리밋 정리 + 오프라인 브로드캐스트(유령 온라인 방지).
+        void io.in('acct:' + accountId).disconnectSockets(true)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+    // 갠홈 둘러보기 — 전체 사용자 공개 요약. (공개 디렉터리 — 인증 불필요)
+    if (req.method === 'GET' && req.url === '/users') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, users: auth.listUsers() }))
+      return
+    }
+    // 타인/내 갠홈 보기 — 공개 프로필 + 방명록. GET /home?id=<userId>.
+    // 비공개 계정이어도 프로필 자체는 내준다. 방을 함께 쓰는 사람의 프로필 카드·친구 목록·DM 이 전부
+    // 이 응답을 쓰므로, 여기서 막으면 세션 중에 이름과 사진이 사라진다. 닫는 것은 로비 안의 내용
+    // (방명록·꾸밈·블로그·세션 로그)이고, 그 사실은 locked 표시로 알린다.
+    // 열람자는 Authorization: Bearer 로 밝힌다 — 주소에 토큰을 싣지 않는다.
+    if (req.method === 'GET' && req.url && (req.url === '/home' || req.url.startsWith('/home?'))) {
+      const id = new URLSearchParams(req.url.split('?')[1] ?? '').get('id') ?? ''
+      const home = auth.getHome(id)
+      if (!home) {
+        res.writeHead(404, JSON_H)
+        res.end(JSON.stringify({ ok: false, error: '사용자를 찾을 수 없습니다.' }))
+        return
+      }
+      const open = auth.canViewLobby(bearerViewerId(req), id)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, account: home.account, guestbook: open ? home.guestbook : [], locked: !open }))
+      return
+    }
+    // 방명록 글 남기기 — 토큰 인증. 본문 { token, target, message }. 성공 시 홈 주인에게 알림.
+    if (req.method === 'POST' && req.url === '/guestbook') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const author = auth.verifyToken(token)
+        if (!author) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '로그인이 필요합니다.' }))
+          return
+        }
+        // 레이트리밋 — 방명록 도배가 대상의 알림 피드를 밀어내고(축출) 동기 저장을 반복시키지 않게.
+        if (socialLimited(author.id, res)) return
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (lobbyLocked(res, author.id, target)) return
+        const message = typeof body.message === 'string' ? body.message : ''
+        const result = auth.addGuestbookEntry(token, target, message)
+        if (result.ok) notify(target, { kind: 'guestbook', actor: actorOf(author), text: message })
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 내 로비 공개(동기화) — 토큰 인증. 본문 { token, lobby }. 이미지 포함이라 더 큰 본문 허용(readRawBody).
+    if (req.method === 'POST' && req.url === '/lobby') {
+      withRawBody(req, res, 12 * 1024 * 1024, (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '로비 데이터가 비었거나 너무 큽니다.' }))
+          return
+        }
+        let body: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(buf.toString('utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+        } catch {
+          body = {}
+        }
+        const token = typeof body.token === 'string' ? body.token : ''
+        // 손님은 로비를 꾸밀 수 없다(호스팅 용량 보호) — 공개 스냅샷 동기화 거부.
+        if (auth.verifyToken(token)?.role === 'guest') {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 로비를 꾸밀 수 없습니다.' }))
+          return
+        }
+        // 보내는 기기가 아는 '그림 참조 수' — 0 이면 정말 그림이 없는 로비, 없으면 알 수 없음(옛 프로그램).
+        const refCount = typeof body.imageIds === 'number' ? body.imageIds : undefined
+        // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀는가 — 빈 로비로 덮는 것은 이때만 허용한다.
+        const explicitEmpty = body.explicitEmpty === true
+        const result = auth.setLobby(token, body.lobby, refCount, explicitEmpty)
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 내 로비 음악 보관함 저장 — 토큰 인증. 오디오를 담아 본문이 크므로 /lobby 와 같은 한도로 읽는다.
+    if (req.method === 'POST' && req.url === '/lobby/music') {
+      withRawBody(req, res, 48 * 1024 * 1024, (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '음악 목록이 비었거나 너무 큽니다.' }))
+          return
+        }
+        let body: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(buf.toString('utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+        } catch {
+          body = {}
+        }
+        const token = typeof body.token === 'string' ? body.token : ''
+        // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀는가 — 보관함을 비우는 것은 이때만 허용한다.
+        const result = auth.setLobbyMusic(token, body.tracks, { explicitEmpty: body.explicitEmpty === true })
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 내 로비 음악 보관함 조회 — 본인만(Authorization: Bearer). 토큰을 주소에 싣지 않는다.
+    if (req.method === 'GET' && req.url === '/lobby/music') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const tracks = auth.getLobbyMusic(token)
+      res.writeHead(tracks ? 200 : 401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(tracks ? { ok: true, tracks } : { ok: false, error: '로그인이 필요합니다.' }))
+      return
+    }
+    // 내 세션 BGM 라이브러리 보관함 저장 — 토큰 인증. 오디오를 담아 본문이 크므로 /lobby 와 같은 한도로 읽는다.
+    if (req.method === 'POST' && req.url === '/bgm/library') {
+      withRawBody(req, res, 48 * 1024 * 1024, (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '음원 목록이 비었거나 너무 큽니다.' }))
+          return
+        }
+        let body: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(buf.toString('utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+        } catch {
+          body = {}
+        }
+        const token = typeof body.token === 'string' ? body.token : ''
+        const result = auth.setBgmLibrary(token, body.tracks, { explicitEmpty: body.explicitEmpty === true })
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 내 세션 BGM 라이브러리 보관함 조회 — 본인만(Authorization: Bearer). 토큰을 주소에 싣지 않는다.
+    if (req.method === 'GET' && req.url === '/bgm/library') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const tracks = auth.getBgmLibrary(token)
+      res.writeHead(tracks ? 200 : 401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(tracks ? { ok: true, tracks } : { ok: false, error: '로그인이 필요합니다.' }))
+      return
+    }
+    // 타인/내 로비 열람 — 공개 스냅샷. GET /lobby?id=<userId>.
+    // 비공개 계정이면 친구·본인·관리자만. 열람자는 Authorization: Bearer 로 밝힌다.
+    if (req.method === 'GET' && req.url && (req.url === '/lobby' || req.url.startsWith('/lobby?'))) {
+      const id = new URLSearchParams(req.url.split('?')[1] ?? '').get('id') ?? ''
+      if (lobbyLocked(res, bearerViewerId(req), id)) return
+      const lobby = auth.getLobby(id)
+      res.writeHead(lobby ? 200 : 404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(lobby ? { ok: true, lobby } : { ok: false, error: '로비를 찾을 수 없습니다.' }))
+      return
+    }
+    // 방명록 글 삭제 — 홈 주인/작성자만. 본문 { token, target, entryId }.
+    if (req.method === 'POST' && req.url === '/guestbook/delete') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const target = typeof body.target === 'string' ? body.target : ''
+        const entryId = typeof body.entryId === 'string' ? body.entryId : ''
+        const result = auth.removeGuestbookEntry(token, target, entryId)
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // DM 보내기 — 토큰 인증. 본문 { token, to, text }. 성공 시 양쪽 개인룸으로 실시간 푸시.
+    if (req.method === 'POST' && req.url === '/dm/send') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        // 레이트리밋 — 계정당 10초에 30건. 초과 시 429(이벤트 루프 보호).
+        const now = Date.now()
+        const rl = dmRate.get(account.id)
+        if (!rl || now > rl.resetAt) {
+          dmRate.set(account.id, { count: 1, resetAt: now + 10_000 })
+        } else if (rl.count >= 30) {
+          res.writeHead(429, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '너무 자주 보냈습니다. 잠시 후 다시 시도하세요.' }))
+          return
+        } else {
+          rl.count++
+        }
+        const text = typeof body.text === 'string' ? body.text : ''
+        // 그룹 분기 — threadId 가 있으면 멤버 전원 팬아웃(레이트리밋은 위 공용 버킷을 이미 통과).
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        if (threadId) {
+          const g = dm.group(threadId)
+          if (!g || !g.members.includes(account.id)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: '그룹 대화에 참여하고 있지 않습니다.' }))
+            return
+          }
+          const msg = dm.appendGroup(account.id, threadId, text)
+          if (!msg) {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: '메시지를 보낼 수 없습니다.' }))
+            return
+          }
+          for (const m of g.members) io.to('user:' + m).emit('dm:new', msg)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, message: msg }))
+          return
+        }
+        const to = typeof body.to === 'string' ? body.to : ''
+        // 대상이 실재하는 사용자인지 확인(임의 id 로 고아 대화 생성 방지).
+        if (!to || !auth.getHome(to)) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '받는 사람을 찾을 수 없습니다.' }))
+          return
+        }
+        const msg = dm.append(account.id, to, text)
+        if (!msg) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '메시지를 보낼 수 없습니다.' }))
+          return
+        }
+        io.to('user:' + msg.to).emit('dm:new', msg)
+        io.to('user:' + msg.from).emit('dm:new', msg)
+        // 종 알림 — 상대별 최신 1건 유지(연속 메시지 도배 방지). 실시간 토스트는 dm:new 가 담당, 이건 누적 피드.
+        notify(msg.to, { kind: 'dm', actor: actorOf(account), ref: account.id, text: msg.text })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, message: msg }))
+      })
+      return
+    }
+    // DM 수정 — 본인 메시지만. 본문 { token, peer, id, text }. 성공 시 양쪽 개인룸으로 반영.
+    if (req.method === 'POST' && req.url === '/dm/edit') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const id = typeof body.id === 'string' ? body.id : ''
+        const text = typeof body.text === 'string' ? body.text : ''
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        if (threadId) {
+          const g = dm.group(threadId)
+          const msg = g && g.members.includes(account.id) ? dm.editGroup(account.id, threadId, id, text) : null
+          if (!msg || !g) {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: '메시지를 수정할 수 없습니다.' }))
+            return
+          }
+          for (const m of g.members) io.to('user:' + m).emit('dm:edited', msg)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, message: msg }))
+          return
+        }
+        const msg = validPeer(peer) ? dm.edit(account.id, peer, id, text) : null
+        if (!msg) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '메시지를 수정할 수 없습니다.' }))
+          return
+        }
+        io.to('user:' + msg.to).emit('dm:edited', msg)
+        io.to('user:' + msg.from).emit('dm:edited', msg)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, message: msg }))
+      })
+      return
+    }
+    // DM 삭제 — 본인 메시지만. 본문 { token, peer, id }. 성공 시 양쪽 개인룸에서 제거.
+    if (req.method === 'POST' && req.url === '/dm/delete') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const id = typeof body.id === 'string' ? body.id : ''
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        if (threadId) {
+          const g = dm.group(threadId)
+          if (!g || !dm.removeGroup(account.id, threadId, id)) {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: '메시지를 삭제할 수 없습니다.' }))
+            return
+          }
+          for (const m of g.members) io.to('user:' + m).emit('dm:deleted', { id, from: account.id, to: '', threadId })
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true }))
+          return
+        }
+        if (!validPeer(peer) || !dm.remove(account.id, peer, id)) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '메시지를 삭제할 수 없습니다.' }))
+          return
+        }
+        io.to('user:' + peer).emit('dm:deleted', { id, from: account.id, to: peer })
+        io.to('user:' + account.id).emit('dm:deleted', { id, from: account.id, to: peer })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+    // DM 대화 개인 삭제(정리) — 본문 { token, peer }. 내 목록에서만 지우고(상대 유지), 양쪽 모두 지우면 서버 파일 삭제.
+    if (req.method === 'POST' && req.url === '/dm/clear') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        if (threadId) {
+          const ok = dm.clearForGroup(account.id, threadId)
+          if (ok) io.to('user:' + account.id).emit('dm:cleared', { peer: '', by: account.id, threadId }) // 내 다른 세션 동기화
+          res.writeHead(ok ? 200 : 400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '대화를 정리할 수 없습니다.' }))
+          return
+        }
+        const ok = validPeer(peer) && dm.clearFor(account.id, peer)
+        if (ok) io.to('user:' + account.id).emit('dm:cleared', { peer, by: account.id }) // 내 다른 세션 동기화
+        res.writeHead(ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '대화를 정리할 수 없습니다.' }))
+      })
+      return
+    }
+    // DM 대화 내용 — 토큰 인증. 본문 { token, peer }.
+    if (req.method === 'POST' && req.url === '/dm/thread') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        if (threadId) {
+          const messages = dm.groupThread(account.id, threadId)
+          if (messages === null) {
+            // 비멤버 — 접근 거부(빈 대화와 구분).
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: '그룹 대화에 참여하고 있지 않습니다.' }))
+            return
+          }
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, messages }))
+          return
+        }
+        const messages = validPeer(peer) ? dm.thread(account.id, peer) : []
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, messages }))
+      })
+      return
+    }
+    // DM 열람 — 본문 { token, peer }. 그 상대의 종 알림만 읽음 처리한다.
+    // 대화창에서 다 읽었다는 사실이 서버에 닿는 유일한 길이다. 이 길이 없으면 미읽음이 그대로 남아
+    // 재접속·새로고침 때마다 다시 심어진다. 그룹 대화는 종 알림을 만들지 않으므로 대상이 아니다.
+    if (req.method === 'POST' && req.url === '/dm/read') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const changed = peer ? notif.markReadByActor(account.id, 'dm', peer) : 0
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, changed }))
+      })
+      return
+    }
+    // DM 대화 목록 — 토큰 인증. 상대 표시정보(닉·아바타) 동봉. 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dm/list') {
+      withBody(req, res, async (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (dmReadLimited(account.id, res)) return
+        const conversations = await Promise.all(
+          dm.list(account.id).map(async (c) => {
+            const peer = auth.getHome(c.peerId)?.account
+            return {
+              ...c,
+              name: peer ? peer.nickname || peer.username : '(알 수 없음)',
+              avatar: await listAvatar(c.peerId, peer?.avatar),
+              online: visibleOnline(c.peerId),
+              status: publicStatus(c.peerId)
+            }
+          })
+        )
+        // 그룹 대화 — 멤버 표시정보 동봉(정원 16이라 부담 없음). 구클라는 이 필드를 몰라 무시(하위호환).
+        const groups = await Promise.all(
+          dm.listGroups(account.id).map(async (g) => ({
+            threadId: g.threadId,
+            title: g.title,
+            last: g.last,
+            lastFrom: g.lastFrom,
+            updatedAt: g.updatedAt,
+            members: await Promise.all(
+              g.members.map(async (id) => {
+                const a = auth.getHome(id)?.account
+                return {
+                  id,
+                  name: a ? a.nickname || a.username : '(알 수 없음)',
+                  avatar: await listAvatar(id, a?.avatar),
+                  online: visibleOnline(id)
+                }
+              })
+            )
+          }))
+        )
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, conversations, groups }))
+      })
+      return
+    }
+
+    // 그룹 DM 생성 — 본문 { token, members: string[], title? }. 본인 자동 포함, 총원 2~16.
+    if (req.method === 'POST' && req.url === '/dm/group/create') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        // 그룹 양산 스팸 방지 — DM 공용 버킷 소비.
+        const now = Date.now()
+        const rl = dmRate.get(account.id)
+        if (!rl || now > rl.resetAt) {
+          dmRate.set(account.id, { count: 1, resetAt: now + 10_000 })
+        } else if (rl.count >= 30) {
+          res.writeHead(429, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '너무 자주 요청했어요. 잠시 후 다시 시도하세요.' }))
+          return
+        } else {
+          rl.count++
+        }
+        const members = Array.isArray(body.members)
+          ? (body.members as unknown[]).filter((x): x is string => typeof x === 'string' && !!x)
+          : []
+        if (members.some((id) => id !== account.id && !auth.getHome(id))) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '초대할 사용자를 찾을 수 없습니다.' }))
+          return
+        }
+        const title = typeof body.title === 'string' ? body.title : undefined
+        const g = dm.createGroup(account.id, members, title)
+        if (!g) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(
+            JSON.stringify({ ok: false, error: `그룹은 본인 포함 2~${MAX_GROUP_MEMBERS}명으로 만들 수 있습니다.` })
+          )
+          return
+        }
+        for (const m of g.members) io.to('user:' + m).emit('dm:group:update', { threadId: g.threadId })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, group: g }))
+      })
+      return
+    }
+    // 그룹 DM 초대 — 본문 { token, threadId, userId }. 멤버 누구나 초대 가능(합류 이전 히스토리는 가림).
+    if (req.method === 'POST' && req.url === '/dm/group/invite') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        if (!userId || !auth.getHome(userId)) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '초대할 사용자를 찾을 수 없습니다.' }))
+          return
+        }
+        const g = dm.invite(account.id, threadId, userId)
+        if (!g) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '초대할 수 없습니다(이미 멤버이거나 정원 초과).' }))
+          return
+        }
+        for (const m of g.members) io.to('user:' + m).emit('dm:group:update', { threadId: g.threadId })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, group: g }))
+      })
+      return
+    }
+    // 그룹 DM 나가기 — 본문 { token, threadId }. 마지막 멤버가 나가면 파일 삭제.
+    if (req.method === 'POST' && req.url === '/dm/group/leave') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const threadId = typeof body.threadId === 'string' ? body.threadId : ''
+        const r = dm.leave(account.id, threadId)
+        if (!r.ok) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '그룹에서 나갈 수 없습니다.' }))
+          return
+        }
+        // 잔존 멤버 + 탈퇴자 본인(멀티세션 동기화 — 재조회 시 목록에서 사라짐)에게 통지.
+        for (const m of [...r.remaining, account.id]) io.to('user:' + m).emit('dm:group:update', { threadId })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // 알림 목록 — 본문 { token }. 최신순 + 미읽음 수.
+    if (req.method === 'POST' && req.url === '/notif/list') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, notifications: notif.list(account.id), unread: notif.unreadCount(account.id) }))
+      })
+      return
+    }
+    // 알림 읽음 처리 — 본문 { token, ids? }. ids 없으면 전체 읽음(본인 피드만 — 서버 권위).
+    if (req.method === 'POST' && req.url === '/notif/read') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const ids = Array.isArray(body.ids)
+          ? (body.ids as unknown[]).filter((x): x is string => typeof x === 'string')
+          : undefined
+        notif.markRead(account.id, ids)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+    // 알림 전체 지우기 — 본문 { token }. 본인 피드만 비운다(서버 권위).
+    if (req.method === 'POST' && req.url === '/notif/clear') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        notif.clear(account.id)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // ===== 블로그/게시글 — 자기 로비의 글. 목록/상세는 토큰 선택(있으면 작성자 권한·내 좋아요 반영). =====
+    // 글 목록 — 본문 { token?, target }. 작성자 본인이면 비공개·임시저장 포함, 아니면 공개·비임시만.
+    if (req.method === 'POST' && req.url === '/posts/list') {
+      withBody(req, res, (body) => {
+        const viewer = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (lobbyLocked(res, viewer?.id ?? null, target)) return
+        const result = posts.listFor(viewer?.id ?? null, target)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, ...result }))
+      })
+      return
+    }
+    // 글 상세 — 본문 { token?, id }. 비공개/임시저장은 작성자만(아니면 404).
+    if (req.method === 'POST' && req.url === '/post/get') {
+      withBody(req, res, (body) => {
+        const viewer = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        const id = typeof body.id === 'string' ? body.id : ''
+        const owner = posts.ownerOf(id)
+        if (owner && lobbyLocked(res, viewer?.id ?? null, owner)) return
+        const r = posts.get(viewer?.id ?? null, id)
+        if (!r) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '글을 찾을 수 없습니다.' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, post: r.post, liked: r.liked }))
+      })
+      return
+    }
+    // 글 작성/수정 — 토큰 인증. 본문 { token, post }. 본문 HTML 은 저장 시 화이트리스트 정규화.
+    if (req.method === 'POST' && req.url === '/post/save') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 블로그 글을 쓸 수 없습니다.' }))
+          return
+        }
+        const input = body.post && typeof body.post === 'object' ? (body.post as Record<string, unknown>) : {}
+        const result = posts.save(account.id, input)
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 글 삭제 — 토큰 인증(작성자). 본문 { token, id }.
+    if (req.method === 'POST' && req.url === '/post/delete') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const id = typeof body.id === 'string' ? body.id : ''
+        const ok = posts.remove(account.id, id)
+        res.writeHead(ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '삭제할 수 없습니다(작성자만).' }))
+      })
+      return
+    }
+    // 좋아요 토글 — 토큰 인증(누구나). 본문 { token, id }.
+    if (req.method === 'POST' && req.url === '/post/like') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const id = typeof body.id === 'string' ? body.id : ''
+        const likeOwner = posts.ownerOf(id)
+        if (likeOwner && lobbyLocked(res, account.id, likeOwner)) return
+        const r = posts.toggleLike(account.id, id)
+        if (!r) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '처리할 수 없습니다.' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, ...r }))
+      })
+      return
+    }
+    // 댓글 작성 — 토큰 인증(누구나). 본문 { token, postId, text }.
+    if (req.method === 'POST' && req.url === '/post/comment') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        // 레이트리밋 — 댓글 도배가 글 주인의 알림 피드를 밀어내지(축출) 않게(방명록과 동일 버킷).
+        if (socialLimited(account.id, res)) return
+        const postId = typeof body.postId === 'string' ? body.postId : ''
+        const commentOwner = posts.ownerOf(postId)
+        if (commentOwner && lobbyLocked(res, account.id, commentOwner)) return
+        const text = typeof body.text === 'string' ? body.text : ''
+        const parentId = typeof body.parentId === 'string' ? body.parentId : undefined
+        const r = posts.addComment(
+          { id: account.id, name: account.nickname || account.username, avatar: account.avatar },
+          postId,
+          text,
+          parentId
+        )
+        if (!r) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '댓글을 남길 수 없습니다.' }))
+          return
+        }
+        // 종 알림 — 답글이면 부모 댓글 작성자에게 reply, 글 주인에게는 comment(부모 작성자=글 주인이면 reply 1건만).
+        // notify(push)가 자기 알림을 걸러주므로 셀프 댓글·셀프 답글은 자연 무시된다.
+        const actor = actorOf(account)
+        if (r.parentAuthorId) notify(r.parentAuthorId, { kind: 'reply', actor, ref: r.post.id, text: r.comment.text })
+        if (r.post.authorId !== r.parentAuthorId) {
+          notify(r.post.authorId, { kind: 'comment', actor, ref: r.post.id, text: r.comment.text })
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, comment: r.comment }))
+      })
+      return
+    }
+    // 댓글 수정 — 토큰 인증(작성자). 본문 { token, postId, commentId, text }.
+    if (req.method === 'POST' && req.url === '/post/comment/edit') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const postId = typeof body.postId === 'string' ? body.postId : ''
+        const commentId = typeof body.commentId === 'string' ? body.commentId : ''
+        const text = typeof body.text === 'string' ? body.text : ''
+        const comment = posts.editComment(account.id, postId, commentId, text)
+        if (!comment) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '댓글을 수정할 수 없습니다.' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, comment }))
+      })
+      return
+    }
+    // 댓글 삭제 — 토큰 인증(댓글 작성자 또는 글 주인). 본문 { token, postId, commentId }.
+    if (req.method === 'POST' && req.url === '/post/comment/delete') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const postId = typeof body.postId === 'string' ? body.postId : ''
+        const commentId = typeof body.commentId === 'string' ? body.commentId : ''
+        const ok = posts.removeComment(account.id, postId, commentId)
+        res.writeHead(ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '댓글을 삭제할 수 없습니다.' }))
+      })
+      return
+    }
+    // 게시판 목록 교체 — 토큰 인증(작성자). 본문 { token, boards }. 사라진 게시판의 글은 미분류로.
+    if (req.method === 'POST' && req.url === '/boards/set') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 블로그를 관리할 수 없습니다.' }))
+          return
+        }
+        const boards = posts.setBoards(account.id, body.boards)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, boards }))
+      })
+      return
+    }
+
+    // ===== 세션 로그 — 방 채팅 로그를 로비에 백업한 스냅샷. 본문은 sandbox iframe 으로 격리 렌더(화이트리스트 X). =====
+    // 목록 — 본문 { token?, target }. 작성자 본인이면 비공개 포함, 아니면 공개만.
+    if (req.method === 'POST' && req.url === '/slogs/list') {
+      withBody(req, res, (body) => {
+        const viewer = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (lobbyLocked(res, viewer?.id ?? null, target)) return
+        const result = sessionlogs.listFor(viewer?.id ?? null, target)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, ...result }))
+      })
+      return
+    }
+    // 상세 — 본문 { token?, id }. 비공개는 작성자만(아니면 404).
+    if (req.method === 'POST' && req.url === '/slog/get') {
+      withBody(req, res, (body) => {
+        const viewer = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        const id = typeof body.id === 'string' ? body.id : ''
+        const owner = sessionlogs.ownerOf(id)
+        if (owner && lobbyLocked(res, viewer?.id ?? null, owner)) return
+        const r = sessionlogs.get(viewer?.id ?? null, id)
+        if (!r) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '세션 로그를 찾을 수 없습니다.' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, log: r.log }))
+      })
+      return
+    }
+    // 백업 생성/수정 — 토큰 인증. 본문 { token, log }. 새 백업은 html(외부화된 자기완결 문서) 필요,
+    // id 있으면 수정(html 은 로비 편집기가 보낼 때만 본문 교체 — 새니타이저 재통과, 없으면 메타만).
+    if (req.method === 'POST' && req.url === '/slog/save') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 세션 로그를 백업할 수 없습니다.' }))
+          return
+        }
+        const input = body.log && typeof body.log === 'object' ? (body.log as Record<string, unknown>) : {}
+        const result = sessionlogs.save(account.id, input)
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 삭제 — 토큰 인증(작성자). 본문 { token, id }.
+    if (req.method === 'POST' && req.url === '/slog/delete') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const id = typeof body.id === 'string' ? body.id : ''
+        const ok = sessionlogs.remove(account.id, id)
+        res.writeHead(ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '삭제할 수 없습니다(작성자만).' }))
+      })
+      return
+    }
+    // 세션 로그 게시판 목록 교체 — 토큰 인증(작성자). 본문 { token, boards }. 블로그와 별도 목록.
+    if (req.method === 'POST' && req.url === '/slogs/boards/set') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 세션 로그를 관리할 수 없습니다.' }))
+          return
+        }
+        const boards = sessionlogs.setBoards(account.id, body.boards)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, boards }))
+      })
+      return
+    }
+
+    // ===== 친구 — 아이디로 신청·수락·거절·끊기·목록(손님 포함 누구나). 변경 시 상대에게 friend:update 푸시. =====
+    if (req.method === 'POST' && req.url === '/friend/request') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const username = typeof body.username === 'string' ? body.username : ''
+        const r = auth.friendRequest(token, username)
+        if (r.ok) {
+          if (r.targetId) io.to('user:' + r.targetId).emit('friend:update')
+          if (r.selfId) io.to('user:' + r.selfId).emit('friend:update') // 본인 다른 기기 동기화
+          // 종 알림 — 자동수락(상대가 먼저 신청해 둔 경우)이면 '수락', 아니면 '신청 도착'.
+          const actor = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+          if (actor && r.targetId) {
+            notify(r.targetId, {
+              kind: 'friend',
+              actor: actorOf(actor),
+              ref: actor.id,
+              text: r.autoAccepted ? '친구 신청을 수락했어요.' : '친구 신청을 보냈어요.'
+            })
+          }
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 친구 검색 — 본문 { token, q }. 아이디/닉네임 부분 일치 후보(동명이인 나열 — 클라가 선택해 신청).
+    if (req.method === 'POST' && req.url === '/friend/search') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const q = (typeof body.q === 'string' ? body.q : '').trim().toLowerCase()
+        if (q.length < 1) {
+          res.writeHead(200, JSON_H)
+          res.end(JSON.stringify({ ok: true, users: [] }))
+          return
+        }
+        // 서버측 필터 — 전체 디렉터리를 클라로 보내지 않는다. 본인 제외, 최대 20명.
+        const users = auth
+          .listUsers()
+          .filter(
+            (u) =>
+              u.id !== account.id &&
+              (u.username.toLowerCase().includes(q) || (u.nickname ?? '').toLowerCase().includes(q))
+          )
+          .slice(0, 20)
+          .map((u) => ({ ...u, online: visibleOnline(u.id) }))
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, users }))
+      })
+      return
+    }
+    // 친구 목록 차례 바꾸기 — 서버에 남겨 다른 기기·웹판에서도 같은 차례로 보인다.
+    if (req.method === 'POST' && req.url === '/friend/reorder') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const ids = Array.isArray(body.ids) ? (body.ids as unknown[]).filter((x): x is string => typeof x === 'string') : []
+        const r = auth.reorderFriends(token, ids)
+        if (r.ok) {
+          const me = auth.verifyToken(token)
+          if (me) io.to('user:' + me.id).emit('friend:update') // 본인 다른 기기 동기화
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    if (
+      req.method === 'POST' &&
+      (req.url === '/friend/accept' || req.url === '/friend/reject' || req.url === '/friend/remove')
+    ) {
+      const url = req.url
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const r =
+          url === '/friend/accept'
+            ? auth.acceptFriend(token, userId)
+            : url === '/friend/reject'
+              ? auth.rejectFriend(token, userId)
+              : auth.removeFriend(token, userId)
+        if (r.ok) {
+          if (r.targetId) io.to('user:' + r.targetId).emit('friend:update')
+          if (r.selfId) io.to('user:' + r.selfId).emit('friend:update') // 본인 다른 기기 동기화
+          // 종 알림 — 수락만(거절·끊기는 조용히).
+          if (url === '/friend/accept' && r.targetId) {
+            const actor = auth.verifyToken(token)
+            if (actor) {
+              notify(r.targetId, {
+                kind: 'friend',
+                actor: actorOf(actor),
+                ref: actor.id,
+                text: '친구 신청을 수락했어요.'
+              })
             }
           }
-          if (rescueGone) {
-            this.trimJournal(room.id, cut) // 스냅샷에 담긴 몫만 덜어낸다
-            this.saveTrouble.delete(room.id)
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/friend/list') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const r = auth.friendList(token)
+        if (!r.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(r))
+          return
+        }
+        // 온라인·상태 표시는 프레즌스 헬퍼로 덧붙인다(invisible=오프라인 위장).
+        const withOnline = (arr: { id: string }[]): unknown[] =>
+          arr.map((u) => ({ ...u, online: visibleOnline(u.id), status: publicStatus(u.id) }))
+        res.writeHead(200, JSON_H)
+        res.end(
+          JSON.stringify({
+            ok: true,
+            friends: withOnline(r.friends),
+            incoming: withOnline(r.incoming),
+            outgoing: withOnline(r.outgoing)
+          })
+        )
+      })
+      return
+    }
+
+    // ===== 서버 관리(관리자 전용) — 호스팅 용량 모니터링·회수 =====
+    // 멤버별 용량 상세 + 서버 전체 요약. 1회 전역 스캔(방·캐릭터·블로그·로비/프로필 참조 + 자산 크기).
+    if (req.method === 'POST' && req.url === '/admin/overview') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const accountsList = auth.listForAdmin()
+        const online = new Set(presence.keys())
+        // 유저별 카테고리 바이트 + 참조 자산 해시 집합.
+        const per = accountsList.map((u) => {
+          const rooms = store.usageForOwner(u.id)
+          const chars = characters.usageFor(u.id)
+          const blog = posts.usageFor(u.id)
+          const slog = sessionlogs.usageFor(u.id)
+          const prof = auth.usageForUser(u.id)
+          const dt = dottown.usageFor(u.id) // 도트타운 마이룸·캐릭터(메타) 용량
+          const econ = economy.usageFor(u.id) // 도트타운 코인 지갑·소유·원장(메타) 용량
+          const refs = new Set<string>([...rooms.refs, ...chars.refs, ...blog.refs, ...slog.refs, ...prof.refs, ...dt.refs])
+          return { u, rooms, chars, blog, slog, prof, dt, econ, refs }
+        })
+        // 전역 참조 카운트(고유 판정용) — 한 해시를 몇 명이 참조하는지.
+        const refCount = new Map<string, number>()
+        for (const p of per) for (const h of p.refs) refCount.set(h, (refCount.get(h) ?? 0) + 1)
+        const sizes = assets.sizesOf(refCount.keys()) // 참조 해시 크기 일괄 조회(중복 제거)
+        const sizeOf = (h: string): number => sizes.get(h) ?? 0
+        const users = per.map(({ u, rooms, chars, blog, slog, prof, dt, econ, refs }) => {
+          let assetLogical = 0
+          let assetUnique = 0
+          for (const h of refs) {
+            const sz = sizeOf(h)
+            assetLogical += sz
+            if (refCount.get(h) === 1) assetUnique += sz // 이 유저만 참조 → 삭제 시 실제 회수될 바이트
+          }
+          // '로비' 컬럼은 로비 스냅샷만(= '로비 초기화' 회수 범위와 일치). 프로필(아바타·배너·방명록)은 별도로
+          // 합계에 포함하되 컬럼엔 안 섞는다 — 컬럼이 약속한 만큼 초기화로 회수되게 한다.
+          // 커뮤니티는 조직 소유라 글은 계정 삭제로 사라지지 않지만, 용량은 올린 사람 앞으로 잡아 준다.
+          const cmty = cmtyPosts.usageFor(u.id)
+          const cmtyC = cmtyChars.usageFor(u.id)
+          const serialized = rooms.bytes + chars.bytes + blog.bytes + slog.bytes + prof.lobbyBytes + prof.profileBytes + dt.bytes + econ.bytes + cmty.bytes + cmtyC.bytes
+          return {
+            id: u.id,
+            username: u.username,
+            nickname: u.nickname,
+            avatar: u.avatar,
+            role: u.role,
+            createdAt: u.createdAt,
+            // 로비를 친구에게만 열어 둔 계정인가. 관리자가 '왜 이 사람 로비가 안 열리지'를 여기서 바로 안다.
+            lobbyPrivate: !!u.lobbyPrivate,
+            lastSeenAt: u.lastSeenAt, // 마지막 접속 일시(로그인·연결/종료 시 갱신)
+            online: online.has(u.id),
+            // 관리자 대시보드는 실상태(invisible 포함) — 서버 소유자는 어차피 로그로 확인 가능(운영 목적, 위장 대상 아님).
+            status: effectiveStatus(u.id) ?? undefined,
+            rooms: { count: rooms.count, bytes: rooms.bytes },
+            roomList: rooms.list, // 개별 방 삭제용(id·제목·코드·바이트)
+            characters: { count: chars.count, bytes: chars.bytes },
+            posts: { count: blog.count, bytes: blog.bytes },
+            sessionlogs: { count: slog.count, bytes: slog.bytes },
+            lobbyBytes: prof.lobbyBytes,
+            profileBytes: prof.profileBytes,
+            dottownBytes: dt.bytes + econ.bytes,
+            communityBytes: cmty.bytes + cmtyC.bytes,
+            coins: economy.balanceOf(u.id),
+            assetBytesLogical: assetLogical,
+            assetBytesUnique: assetUnique,
+            totalLogical: serialized + assetLogical
+          }
+        })
+        // 서버 전체: 총 자산 디스크 + 라이브(참조됨) + 고아(아무도 참조 안 함 = GC 회수 대상).
+        // 라이브 집합은 /admin/gc 의 sweep 과 동일한 전역 참조(소유자 유무 무관)로 계산한다(per-user 분해는 위 refCount 로 별도).
+        // orphanBytes 는 회수 가능량의 상한 — sweep 은 막 업로드된(유예 1시간 내) 미참조 자산은 보존하므로 즉시 회수량은 더 작을 수 있다.
+        const total = assets.totalBytes()
+        const globalLive = new Set<string>()
+        store.collectAssetRefs(globalLive)
+        characters.collectAssetRefs(globalLive)
+        auth.collectAssetRefs(globalLive)
+        posts.collectAssetRefs(globalLive)
+        sessionlogs.collectAssetRefs(globalLive)
+        dottown.collectAssetRefs(globalLive) // /admin/gc 와 동일 라이브셋(방명록 authorAvatar 등)
+        economy.collectAssetRefs(globalLive) // /admin/gc·주기 GC 와 목록을 맞춘다(빠져 있으면 표시와 실제가 갈린다)
+        market.collectAssetRefs(globalLive) // ⚠UGC 마켓: 등록/보유 아이템 이미지(안 실으면 최대 6시간 뒤 회수)
+        community.collectAssetRefs(globalLive)
+        cmtyPosts.collectAssetRefs(globalLive)
+        cmtyChars.collectAssetRefs(globalLive) // ⚠커뮤니티 이미지(설정·글·캐릭터) — 안 실으면 회수된다
+        cmtyCatalog.collectAssetRefs(globalLive) // ⚠아이템 그림·상점 배너
+        cmtyGifts.collectAssetRefs(globalLive) // ⚠보내는 중인 선물의 편지 그림
+        cmtyGames.collectAssetRefs(globalLive) // ⚠퀘스트 배너·완료 카드·장면 그림
+        listAvatarRefs(globalLive) // ⚠DM 목록이 옮겨 놓은 프사 — 빠뜨리면 '회수 가능'이 실제보다 부풀어 보인다
+        const liveSizes = assets.sizesOf(globalLive)
+        let liveBytes = 0
+        for (const h of globalLive) liveBytes += liveSizes.get(h) ?? 0
+        // '회수 가능'은 실제 청소가 지울 것과 같은 코드로 센다(dry-run). 단순 뺄셈으로 세면
+        // 유예 중인 파일까지 회수 가능으로 보여, 눌러도 0 이 나오는 일이 반복된다.
+        const orphan = assets.orphanStats(globalLive)
+        const summary = {
+          accountCount: accountsList.length,
+          roomCount: store.roomCount,
+          assetCount: total.count,
+          assetBytes: total.bytes,
+          liveAssetBytes: liveBytes,
+          orphanBytes: orphan.freed,
+          /** 미참조지만 아직 유예 중이라 지금은 못 지우는 양(잠시 뒤면 회수된다). */
+          deferredBytes: orphan.deferredBytes
+        }
+        res.writeHead(200, JSON_H)
+        // 저장이 말썽인 방은 반드시 눈에 띄어야 한다 — 그대로 두면 재시작하는 순간 그 사이 대화가 사라진다.
+        res.end(
+          JSON.stringify({
+            ok: true,
+            summary,
+            users,
+            communityEnabled: community.enabled(),
+            // 커뮤니티 성격 — 아직 안 열었으면 null. 서버 관리 화면의 전환 손잡이가 쓴다.
+            communityMode: community.settings()?.mode ?? null,
+            saveTroubles: store.saveTroubles()
+          })
+        )
+      })
+      return
+    }
+
+    // 커뮤니티 기능 켬/끔 — 서버 주인만. 꺼 두면 모든 유저의 바탕화면에서 아이콘까지 사라진다.
+    if (req.method === 'POST' && req.url === '/admin/community') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        if (typeof body.enabled === 'boolean') community.setEnabled(body.enabled)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, enabled: community.enabled() }))
+      })
+      return
+    }
+
+    // 등급 변경(승인 member / 강등 guest) — 대상 접속 세션에 즉시 반영(소켓 data 갱신 + role:changed 푸시).
+    if (req.method === 'POST' && req.url === '/admin/role') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const role = body.role === 'member' ? 'member' : body.role === 'guest' ? 'guest' : null
+        if (!role) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '잘못된 등급입니다.' }))
+          return
+        }
+        const r = auth.setRole(userId, role)
+        if (!r.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(r))
+          return
+        }
+        for (const s of io.sockets.sockets.values()) {
+          if (s.data.account?.id === userId) {
+            s.data.account.role = role
+            s.emit('role:changed', { role })
           }
         }
-      } catch (e) {
-        // 디스크가 찼거나 볼륨이 떨어져 나간 경우다. 조용히 넘어가면 서버가 도는 동안에는 아무도 모르다가
-        // 다시 시작하는 순간 그 사이의 대화가 전부 사라진다 — 관리 화면에서 보이게 남긴다.
-        this.saveTrouble.set(room.id, `저장 실패: ${String(e)}`)
-        console.error(`[rooms] ${room.id}(${room.title}) 저장 실패:`, e)
-        try {
-          await unlink(tmp)
-        } catch {
-          /* tmp 없음/이미 정리 — 무시 */
-        }
-      } finally {
-        this.flushing.delete(room.id)
-        this.flushStartedAt.delete(room.id)
-      }
-    })()
-    this.flushing.set(room.id, work)
-    return work
-  }
-
-  /**
-   * 종료 직전 마무리 — 진행 중인 쓰기를 끝까지 기다린 뒤, 그 사이 바뀐 몫을 한 번 더 저장한다.
-   * 두 번 도는 이유: 첫 판을 기다리는 동안 들어온 변경은 아직 어디에도 없다(대화만 기록장이 받아 준다).
-   */
-  async drain(): Promise<number> {
-    if (!this.persist) return 0
-    // 예약된 뒤따라 쓰기까지 가라앉을 때까지 — 진행 중인 것을 기다리면 그 뒤에 또 붙을 수 있다.
-    for (let i = 0; i < 5 && this.flushing.size; i++) await Promise.all([...this.flushing.values()])
-    return this.flushDirty()
-  }
-
-  /**
-   * 통째로는 문자열이 되지 않는 방을, 오래된 대화를 덜어내며 될 때까지 줄여 직렬화한다.
-   * 최근 대화부터 지키는 것이 목적이라 언제나 뒤쪽을 남긴다.
-   */
-  private serializeTrimmed(room: Room): { json: string; dropped: number } | null {
-    const n = room.messages.length
-    if (!n) return null // 대화 때문이 아니다 — 여기서 할 수 있는 일이 없다
-    // 될 수 있는 대로 많이 남긴다. 하나도 안 남는 저장은 성공이 아니다 —
-    // 그것을 성공으로 치면 빈 스냅샷이 그 방의 대화를 통째로 지운다.
-    const tries: number[] = [n - 1]
-    for (let k = Math.floor(n / 2); k >= 1; k = Math.floor(k / 2)) tries.push(k)
-    for (const keep of tries) {
-      if (keep < 1) continue
-      try {
-        const messages = room.messages.slice(-keep)
-        const json = JSON.stringify(roomToFile({ ...room, messages } as Room))
-        return { json, dropped: n - messages.length }
-      } catch {
-        /* 더 줄여 본다 */
-      }
-    }
-    return null // 한 마디만 남겨도 안 된다 — 큰 것은 대화가 아니거나 최근 쪽에 있다
-  }
-
-  /** 저장이 말썽인 방들 — 관리 화면이 경고를 띄우는 데 쓴다. */
-  saveTroubles(): { id: string; title: string; reason: string; lost?: boolean }[] {
-    const out = [...this.saveLoss].map(([id, reason]) => ({ id, title: this.rooms.get(id)?.title ?? '', reason, lost: true }))
-    for (const [id, reason] of this.saveTrouble) out.push({ id, title: this.rooms.get(id)?.title ?? '', reason, lost: false })
-    // 보관 쪽 말썽은 따로 들고 있다 — 방 저장이 잘된다고 함께 지워지면 막힌 보관소를 아무도 모른다.
-    for (const [id, reason] of this.archiveTrouble)
-      out.push({ id, title: this.rooms.get(id)?.title ?? '', reason, lost: false })
-    return out
-  }
-
-  /** 변경된 방(lastActivityAt > 마지막 저장) 자동 저장(비동기 쓰기). 시작한 저장이 모두 끝나면 그 개수로 resolve. */
-  async flushDirty(): Promise<number> {
-    if (!this.persist) return 0
-    const pending: Promise<void>[] = []
-    for (const room of this.rooms.values()) {
-      if (room.lastActivityAt > (this.savedAt.get(room.id) ?? 0)) pending.push(this.flush(room))
-    }
-    await Promise.all(pending)
-    return pending.length
-  }
-
-  private removeFile(id: string): void {
-    if (!this.persist) return
-    try {
-      const f = join(this.roomDir, id + '.json')
-      if (existsSync(f)) unlinkSync(f)
-      const j = this.journalPath(id)
-      if (existsSync(j)) unlinkSync(j)
-      const r = this.rescuePath(id)
-      if (existsSync(r)) unlinkSync(r)
-      this.removeArchive(id) // 방을 지우면 보관해 둔 대화도 함께 걷는다
-    } catch (e) {
-      console.error(`[rooms] ${id} 파일 삭제 실패:`, e)
-    }
-    this.saveTrouble.delete(id)
-    this.saveLoss.delete(id)
-  }
-
-  /** 세션 목록 항목(요청 계정 기준 owner 플래그). */
-  private summaryFor(room: Room, accountId: string): RoomSummary {
-    return {
-      id: room.id,
-      code: room.code,
-      title: room.title,
-      cardImage: room.cardImage,
-      owner: room.ownerId === accountId,
-      gm: isGm(room, accountId), // 소유자 전용 동작(삭제·복사·이름)과 GM 표시를 가르기 위해 따로 싣는다
-      memberCount: room.members.size,
-      online: [...room.participants.values()].filter((p) => p.connected).length,
-      updatedAt: room.lastActivityAt
-    }
-  }
-
-  private normalize(code: string): string {
-    return code.trim().toUpperCase().replace(/\s+/g, '')
-  }
-
-  /** 방 생성 — 생성자는 GM·소유자. 고유 초대 코드 발급. accountId=소유자 계정(목록·권한), title/cardImage=세션 메타. */
-  createRoom(host: {
-    playerId: string
-    nick: string
-    color: string
-    accountId?: string
-    title?: string
-    cardImage?: string
-  }): { room: Room; self: Participant } {
-    const id = randomUUID()
-    let code = genCode()
-    while (this.codeToId.has(code)) code = genCode()
-    const self: Participant = {
-      playerId: host.playerId,
-      nick: host.nick.trim() || 'GM',
-      color: host.color || DEFAULT_GM_COLOR,
-      role: 'GM',
-      connected: true
-    }
-    const now = Date.now()
-    const firstMap = makeMap('맵 1')
-    const ownerId = host.accountId || host.playerId
-    const room: Room = {
-      id,
-      code,
-      title: (host.title ?? '').trim().slice(0, 80) || '새 세션',
-      ownerId,
-      gmIds: new Set(),
-      members: new Set([ownerId]),
-      cardImage: capImage(host.cardImage),
-      participants: new Map([[self.playerId, self]]),
-      characters: new Map(),
-      charPool: new Map(),
-      handouts: new Map(),
-      maps: new Map([[firstMap.id, firstMap]]),
-      activeMapId: firstMap.id,
-      appearance: { ...DEFAULT_APPEARANCE },
-      bgm: [],
-      combat: null,
-      channels: new Map(),
-      messages: [],
-      charRooms: new Map(),
-      createdAt: now,
-      lastActivityAt: now
-    }
-    this.rooms.set(id, room)
-    this.codeToId.set(code, id)
-    // 만들자마자 한 번 저장한다. 대화 기록장은 첫 마디부터 쓰이는데, 짝이 되는 세션 파일이 없으면
-    // 부팅 때 아무도 그 기록장을 읽지 않는다 — 방을 만들고 바로 나눈 대화가 통째로 사라진다.
-    void this.flush(room)
-    return { room, self }
-  }
-
-  /**
-   * 초대 코드로 입장. 이미 같은 playerId 가 있으면 재접속으로 처리(역할 유지, 닉/색 갱신).
-   * 신규면 PL 로 추가.
-   */
-  joinByCode(
-    code: string,
-    player: { playerId: string; nick: string; color: string; accountId?: string }
-  ): { room: Room; self: Participant } | { error: string } {
-    const roomId = this.codeToId.get(this.normalize(code))
-    if (!roomId) return { error: '존재하지 않는 초대 코드입니다.' }
-    const room = this.rooms.get(roomId)
-    if (!room) return { error: '방을 찾을 수 없습니다.' }
-    const shut = this.lockedOut(room, player)
-    if (shut) return shut
-    return this.admit(room, player)
-  }
-
-  /** roomId 로 직접 입장(세션 목록 클릭) — 소유자/멤버만. 코드 없이 재입장. */
-  enterRoom(
-    roomId: string,
-    player: { playerId: string; nick: string; color: string; accountId?: string }
-  ): { room: Room; self: Participant } | { error: string } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { error: '세션을 찾을 수 없습니다.' }
-    const acct = player.accountId
-    if (acct && !isGm(room, acct) && !room.members.has(acct)) {
-      return { error: '이 세션의 멤버가 아닙니다. 초대 코드로 입장하세요.' }
-    }
-    const shut = this.lockedOut(room, player)
-    if (shut) return shut
-    return this.admit(room, player)
-  }
-
-  /**
-   * 잠긴 방인가 — 방을 만든 사람 말고는 못 들어온다.
-   *
-   * 이미 들어와 있던 사람(끊겼다 돌아오는 사람 포함)은 통과시킨다. 잠금은 '준비 중이니 새로 들어오지
-   * 말라'는 뜻이지, 하던 사람을 끊는 기능이 아니다 — 그렇게 하면 GM 이 잠근 순간 방이 텅 빈다.
-   */
-  private lockedOut(
-    room: Room,
-    player: { playerId: string; accountId?: string }
-  ): { error: string } | null {
-    if (!room.locked) return null
-    if (isGm(room, player.accountId)) return null
-    if (room.participants.has(player.playerId)) return null
-    return { error: '지금은 준비 중이라 들어올 수 없습니다. 방을 만든 사람에게 물어봐 주세요.' }
-  }
-
-  /** 공통 입장 처리: 멤버 등록 + 재접속/신규 참가자(소유자=GM, 그 외 PL). */
-  private admit(
-    room: Room,
-    player: { playerId: string; nick: string; color: string; accountId?: string }
-  ): { room: Room; self: Participant } {
-    room.lastActivityAt = Date.now()
-    if (player.accountId) room.members.add(player.accountId)
-    const gm = isGm(room, player.accountId)
-    const existing = room.participants.get(player.playerId)
-    if (existing) {
-      existing.connected = true
-      if (player.nick.trim()) existing.nick = player.nick.trim()
-      if (player.color) existing.color = player.color
-      // 자리를 비운 사이에 GM 을 받았거나 잃었을 수 있다 — 자격의 진실원본은 gmIds 이므로 여기서 맞춘다.
-      if (player.accountId) existing.role = gm ? 'GM' : 'PL'
-      return { room, self: existing }
-    }
-    const self: Participant = {
-      playerId: player.playerId,
-      nick: player.nick.trim() || (gm ? 'GM' : '탐사자'),
-      color: player.color || (gm ? DEFAULT_GM_COLOR : DEFAULT_PL_COLOR),
-      role: gm ? 'GM' : 'PL', // 소유자·공동 GM 은 재입장 시에도 복원(릴레이 재시작 후 participants 비어도)
-      connected: true
-    }
-    room.participants.set(self.playerId, self)
-    return { room, self }
-  }
-
-  getRoom(roomId: string): Room | undefined {
-    return this.rooms.get(roomId)
-  }
-
-  /** 연결 끊김 표시 — 참가자는 유지(재접속 대기). 방은 sweep 전까지 보존. */
-  markDisconnected(roomId: string, playerId: string): Room | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const p = room.participants.get(playerId)
-    if (p) p.connected = false
-    // connected 는 런타임 상태(디스크에 저장하지 않음)라 lastActivityAt 을 갱신하지 않는다. 갱신하면 끊김/재접속마다
-    // 방이 dirty 로 잡혀 8초 자동저장이 방 전체 히스토리를 동기 재직렬화(이벤트 루프 블록)→핑 타임아웃→끊김 가속 루프가 된다.
-    return room
-  }
-
-  /** 세션 복구 재접속 시 온라인 표시 복원 — 브리프 끊김으로 connected=false 였던 참가자를 다시 true 로. 변경된 방 반환. */
-  markConnected(roomId: string, playerId: string): Room | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const p = room.participants.get(playerId)
-    if (!p || p.connected) return room // 없거나 이미 온라인이면 그대로
-    p.connected = true
-    // connected 는 런타임 상태라 dirty 로 잡지 않는다(markDisconnected 와 동일 — 재접속마다 전체 재직렬화 방지).
-    return room
-  }
-
-  /** 명시적 퇴장 — 참가자·캐릭터 제거. 빈 방이면 즉시 정리. */
-  leave(roomId: string, playerId: string): Room | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.participants.delete(playerId)
-    room.characters.delete(playerId)
-    room.lastActivityAt = Date.now()
-    if (room.participants.size === 0 && !this.persist) {
-      // 비영속: 빈 방 즉시 정리. 영속 모드는 방 유지(재입장 대기 · 소유자 삭제만 제거).
-      this.rooms.delete(room.id)
-      this.codeToId.delete(room.code)
-      return undefined
-    }
-    return room
-  }
-
-  /**
-   * 참가자 본인의 멤버십 탈퇴 — '내 세션 목록'(listForAccount)에서 이 방을 제거한다.
-   * 소유자는 불가(소유자 없는 방 방지 — 소유자는 방 삭제를 사용). 채팅 이력은 보존(퇴장자의 과거 발화 유지 — leave/kick 과 동일).
-   * 시트 데이터는 계정 라이브러리에 있으므로 방별 멤버십(charRooms)만 정리해도 손실 없음.
-   * 같은 초대 코드로 다시 참가하면 members 에 재등록되어 복귀 가능(코드 재발급 없음 — 강퇴와 다름).
-   */
-  leaveMembership(roomId: string, accountId: string, playerId: string): { ok: true } | { error: string } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { error: '세션을 찾을 수 없습니다.' }
-    if (room.ownerId === accountId) return { error: '방장은 목록에서 나갈 수 없습니다. 방 삭제를 이용하세요.' }
-    if (!room.members.has(accountId)) return { error: '이 세션의 멤버가 아닙니다.' }
-    room.members.delete(accountId)
-    // 스스로 목록에서 빠진 사람의 GM 자격도 함께 거둔다 — 남겨 두면 초대 코드로 다시 들어오는 순간
-    // 아무도 지정하지 않았는데 조용히 GM 으로 돌아온다.
-    room.gmIds.delete(accountId)
-    room.participants.delete(playerId)
-    room.characters.delete(playerId)
-    // 아주 떠난 사람의 보관대 몫도 걷는다 — 안 걷으면 그 사람 그림이 방 파일과 입장 전송에 영원히 남는다.
-    this.dropPooledFor(room, playerId)
-    room.charRooms.delete(playerId)
-    room.lastActivityAt = Date.now() // dirty 마킹 — 자동저장(flushDirty)이 영속화
-    return { ok: true }
-  }
-
-  /** 초대 코드 재발급(추방 시). 옛 코드 무효화 → 새 고유 코드 설정·반환. */
-  reissueCode(roomId: string): string | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    this.codeToId.delete(room.code)
-    let code = genCode()
-    while (this.codeToId.has(code)) code = genCode()
-    room.code = code
-    this.codeToId.set(code, roomId)
-    room.lastActivityAt = Date.now()
-    return code
-  }
-
-  /** 방 외형 설정(방 GM 강제 — 권한 검증은 호출 측 relay). 정규화된 저장본 반환, 방 없으면 undefined. */
-  setAppearance(roomId: string, ap: Partial<Appearance> | undefined): Appearance | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.appearance = normalizeAppearance(ap)
-    room.lastActivityAt = Date.now()
-    return room.appearance
-  }
-
-  /**
-   * 방 주사위 연출 카드 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). image 빈값이면 해제.
-   * level 지정 시 그 성공 단계 연출 카드, 없으면 공통 연출 카드(레벨 미설정 폴백).
-   * {ok,image,level} 반환(ok=false면 방 없음/무효 레벨). 크기 캡(애니 GIF/APNG/WebP 보존 — 재인코딩 안 함).
-   */
-  setCutIn(
-    roomId: string,
-    image: string | undefined,
-    level?: SuccessLevel
-  ): { ok: boolean; image?: string; level?: SuccessLevel } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false }
-    const capped = capImage(image)
-    if (level !== undefined) {
-      if (!CUTIN_LEVELS.includes(level)) return { ok: false } // 무효 레벨 무시
-      const imgs = room.cutInImages ?? (room.cutInImages = {})
-      if (capped) imgs[level] = capped
-      else delete imgs[level]
-      if (Object.keys(imgs).length === 0) room.cutInImages = undefined
-      room.lastActivityAt = Date.now()
-      return { ok: true, image: capped, level }
-    }
-    room.cutInImage = capped
-    room.lastActivityAt = Date.now()
-    return { ok: true, image: room.cutInImage }
-  }
-
-  /** ~문장~ 행동지문 색 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). 빈/무효값이면 해제. {ok,color} 반환. */
-  setDimColor(roomId: string, color: string | undefined): { ok: boolean; color?: string } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false }
-    room.dimColor = coerceDimColor(color)
-    room.lastActivityAt = Date.now()
-    return { ok: true, color: room.dimColor }
-  }
-
-  /** GM 커스텀 광기표 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). 빈/무효면 해제(기본표). {ok,tables} 반환. */
-  setMadnessTables(roomId: string, tables: unknown): { ok: boolean; tables?: MadnessTables } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false }
-    room.madnessTables = coerceMadnessTables(tables)
-    room.lastActivityAt = Date.now()
-    return { ok: true, tables: room.madnessTables }
-  }
-
-  /** GM 커스텀 인세인 표 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). 빈/무효면 해제(기본 룰셋 표). {ok,tables} 반환. */
-  setInsaneTables(roomId: string, tables: unknown): { ok: boolean; tables?: InsaneTables } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false }
-    room.insaneTables = coerceInsaneTables(tables)
-    room.lastActivityAt = Date.now()
-    return { ok: true, tables: room.insaneTables }
-  }
-
-  /**
-   * 입실 잠금(공사중) 설정 — 방을 만든 사람 말고는 못 들어오게 한다.
-   * 이미 들어와 있는 사람은 내보내지 않는다(준비 중에 문만 닫는 것이지 쫓아내는 기능이 아니다).
-   */
-  setLocked(roomId: string, locked: boolean): { ok: boolean; locked: boolean } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false, locked: false }
-    room.locked = locked || undefined
-    room.lastActivityAt = Date.now()
-    return { ok: true, locked }
-  }
-
-  /** 행운 깎기(CoC7 하우스룰) 사용 여부 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환. */
-  setLuckEnabled(roomId: string, enabled: boolean): { ok: boolean; enabled: boolean } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false, enabled: true }
-    room.luckEnabled = enabled
-    room.lastActivityAt = Date.now()
-    return { ok: true, enabled }
-  }
-
-  /** 일반 맵 VN 오버레이 표시 여부 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환. */
-  setVnOverlay(roomId: string, enabled: boolean): { ok: boolean; enabled: boolean } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false, enabled: false }
-    room.vnOverlay = enabled
-    room.lastActivityAt = Date.now()
-    return { ok: true, enabled }
-  }
-
-  /** 참가자 오브젝트 추가 허용 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환. */
-  setPlObjects(roomId: string, enabled: boolean): { ok: boolean; enabled: boolean } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false, enabled: false }
-    room.plObjects = enabled
-    room.lastActivityAt = Date.now()
-    return { ok: true, enabled }
-  }
-
-  /**
-   * GM 귓속말 열람 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환.
-   * 켜고 끄는 것은 앞으로 오갈 말에만 미친다 — 이미 오간 말의 각인은 손대지 않는다.
-   */
-  setGmSeeWhispers(roomId: string, enabled: boolean): { ok: boolean; enabled: boolean } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { ok: false, enabled: false }
-    room.gmSeeWhispers = enabled || undefined
-    room.lastActivityAt = Date.now()
-    return { ok: true, enabled }
-  }
-
-  // ===== BGM (다중, GM 제어·전원 동기화 — 권한 검증은 호출 측 relay) =====
-  /** BGM 트랙 추가/교체(trackId 멱등 upsert · playing=true 스탬프). 갱신된 트랙 목록 반환, 무효/방 없으면 null. */
-  setBgm(
-    roomId: string,
-    req:
-      | {
-          trackId?: unknown
-          kind?: unknown
-          src?: unknown
-          title?: unknown
-          loop?: unknown
-          volume?: unknown
-        }
-      | undefined
-  ): BgmState[] | null {
-    const room = this.rooms.get(roomId)
-    if (!room) return null
-    const next = normalizeBgm(req)
-    if (!next) return null // 무효 페이로드는 기존 상태 보존(무시)
-    const i = room.bgm.findIndex((t) => t.trackId === next.trackId)
-    if (i >= 0)
-      room.bgm[i] = next // 같은 트랙 재로드(소스·볼륨 교체)
-    else if (room.bgm.length < MAX_BGM_TRACKS)
-      room.bgm.push(next) // 신규(최대 5)
-    else return null // 5개 가득 — 무시(클라가 막지만 서버도 방어)
-    room.lastActivityAt = Date.now()
-    return room.bgm
-  }
-
-  /** 특정 BGM 트랙 재생/반복·볼륨 토글(소스 유지). 변경된 트랙 상태 반환, 해당 트랙 없으면 undefined. */
-  controlBgm(
-    roomId: string,
-    req: { trackId?: unknown; playing?: unknown; loop?: unknown; volume?: unknown } | undefined
-  ): { trackId: string; playing: boolean; loop: boolean; volume: number } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || typeof req?.trackId !== 'string') return undefined
-    const t = room.bgm.find((x) => x.trackId === req.trackId)
-    if (!t) return undefined
-    if (typeof req.playing === 'boolean') t.playing = req.playing
-    if (typeof req.loop === 'boolean') t.loop = req.loop
-    if (typeof req.volume === 'number' && Number.isFinite(req.volume))
-      t.volume = Math.max(0, Math.min(1, req.volume))
-    room.lastActivityAt = Date.now()
-    return { trackId: t.trackId, playing: t.playing, loop: t.loop, volume: t.volume }
-  }
-
-  /** BGM 정지·해제 — trackId 지정 시 그 트랙만, 없으면 전체. 갱신된 트랙 목록 반환, 방 없으면 undefined. */
-  clearBgm(roomId: string, trackId?: string): BgmState[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.bgm = trackId ? room.bgm.filter((t) => t.trackId !== trackId) : []
-    room.lastActivityAt = Date.now()
-    return room.bgm
-  }
-
-  /**
-   * 전체 트랙을 권위적으로 교체 — GM '나만 듣기'→'전체 동기화' 전환 시 GM 로컬 트랙으로 방을 정확히 맞춰
-   * 고아 트랙(이전에 멈췄지만 동기 누락된)으로 인한 PL 혼선을 제거. 로드 정규화(playing 보존·최대 5) 재사용.
-   */
-  replaceBgm(roomId: string, tracks: unknown): BgmState[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.bgm = coerceLoadedBgmList(tracks)
-    room.lastActivityAt = Date.now()
-    return room.bgm
-  }
-
-  // ===== GM 선택지 — 옵션 스크립트는 서버만 보관(비공개), 응답은 플레이어당 1회 =====
-  /** 선택지 보관(GM 게시 시). 옵션엔 스크립트 포함(브로드캐스트본은 relay 가 제거). */
-  setChoice(
-    roomId: string,
-    messageId: string,
-    options: { id: string; label: string; script?: string }[]
-  ): void {
-    const room = this.rooms.get(roomId)
-    if (!room) return
-    const map = (room.choices ??= new Map())
-    map.set(messageId, { options, responders: new Map() })
-    // 오래된 것부터 버린다 — 옵션 스크립트는 한 건에 수십 KB 까지 갈 수 있어 무제한이면 방 파일이 붓는다.
-    while (map.size > MAX_ROOM_CHOICES) {
-      const oldest = map.keys().next().value
-      if (oldest === undefined) break
-      map.delete(oldest)
-    }
-  }
-  /** 플레이어 선택 처리 — 1회만 허용. 통과 시 해당 옵션(스크립트 포함) 반환, 중복/무효면 null. */
-  selectChoice(
-    roomId: string,
-    messageId: string,
-    optionId: string,
-    playerId: string
-  ): { option: { id: string; label: string; script?: string } } | null {
-    const c = this.rooms.get(roomId)?.choices?.get(messageId)
-    if (!c) return null
-    if (c.responders.has(playerId)) return null // 이미 응답
-    const option = c.options.find((o) => o.id === optionId)
-    if (!option) return null
-    c.responders.set(playerId, option.id)
-    return { option }
-  }
-
-  // ===== 전투 (GM 제어·전원 동기화 — 권한 검증은 호출 측 relay) =====
-  /** 전투 상태 전체 교체(GM). null/빈 목록=종료. 정규화 저장본 반환(종료면 null), 방 없으면 undefined. */
-  setCombat(roomId: string, state: unknown): CombatState | null | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const next = normalizeCombat(state)
-    room.combat = next
-    room.lastActivityAt = Date.now()
-    return next
-  }
-
-  // ===== 그룹 채널 (GM 개설·멤버 라우팅 — 권한 검증은 호출 측 relay) =====
-  /** 그룹 채널 개설(GM). id 서버 생성, 멤버는 현재 참가자만. 생성 채널 반환, 방 없거나 이름 빈값이면 undefined. */
-  createChannel(roomId: string, req: { name?: unknown; members?: unknown } | undefined): Channel | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const name = typeof req?.name === 'string' ? req.name.trim().slice(0, 80) : ''
-    if (!name) return undefined
-    const members = Array.isArray(req?.members)
-      ? [
-          ...new Set(
-            req!.members.filter((m): m is string => typeof m === 'string' && room.participants.has(m))
-          )
-        ].slice(0, 64)
-      : []
-    const ch: Channel = { id: randomUUID(), name, members }
-    room.channels.set(ch.id, ch)
-    room.lastActivityAt = Date.now()
-    return ch
-  }
-
-  /** 그룹 채널 삭제(GM). 있었으면 true. */
-  removeChannel(roomId: string, id: string): boolean {
-    const room = this.rooms.get(roomId)
-    if (!room) return false
-    const had = room.channels.delete(id)
-    if (had) {
-      // 그룹 대화도 함께 지운다 — 채널이 없으면 열람 권한을 판정할 근거가 사라져 GM 조차 다시 볼 수 없다.
-      // 남겨 두면 아무도 못 보는 기록이 방 저장본에만 계속 쌓인다.
-      //
-      // 보관소로 이미 옮겨진 몫은 손대지 않는다. 보관소는 '오간 말은 지우지 않는다'가 약속인 곳이고,
-      // 되읽기는 canAccessChannel 이 없는 채널을 언제나 거절하므로(그래서 아무에게도 안 보인다)
-      // 여기서 그 파일을 다시 쓰는 것보다 그대로 두는 편이 안전하다.
-      const gone = room.messages.filter((m) => m.channel === 'group' && m.groupId === id)
-      if (gone.length) {
-        room.messages = room.messages.filter((m) => !(m.channel === 'group' && m.groupId === id))
-        for (const m of gone) this.journal(roomId, { op: 'del', id: m.id })
-      }
-      room.lastActivityAt = Date.now()
-    }
-    return had
-  }
-
-  /** viewer 가 멤버이거나 GM 인 채널만(viewer 없으면 전체 — 테스트/하위호환). */
-  channelsFor(room: Room, viewer?: { playerId: string; role: Participant['role'] }): Channel[] {
-    const all = [...room.channels.values()]
-    if (!viewer || viewer.role === 'GM') return all
-    return all.filter((c) => c.members.includes(viewer.playerId))
-  }
-
-  /** 채널 메시지 전달 대상 playerId(멤버 + 모든 GM). 채널 없으면 빈 배열. */
-  channelRecipients(roomId: string, channelId: string): string[] {
-    const room = this.rooms.get(roomId)
-    const ch = room?.channels.get(channelId)
-    if (!room || !ch) return []
-    const set = new Set<string>(ch.members)
-    for (const p of room.participants.values()) if (p.role === 'GM') set.add(p.playerId)
-    return [...set]
-  }
-
-  /** 채널 접근(발신) 권한: GM 또는 멤버. 채널 없으면 false. */
-  canAccessChannel(roomId: string, channelId: string, playerId: string): boolean {
-    const room = this.rooms.get(roomId)
-    const ch = room?.channels.get(channelId)
-    if (!room || !ch) return false
-    return room.participants.get(playerId)?.role === 'GM' || ch.members.includes(playerId)
-  }
-
-  // ===== 방 불러오기 (GM 전용 — 권한 검증은 호출 측 relay) =====
-  /**
-   * .orpg 스냅샷의 장면(맵·자료·외형·BGM)을 방에 적용(전부 방어적 정규화).
-   * 참가자·채팅은 라이브 상태라 건드리지 않음. 맵이 비면 빈 맵 1개 보장. 성공 시 true.
-   */
-  loadSnapshot(roomId: string, data: RoomLoadReq | undefined): boolean {
-    const room = this.rooms.get(roomId)
-    if (!room || !data || typeof data !== 'object') return false
-    const maps = new Map<string, RoomMap>()
-    for (const gm of Array.isArray(data.maps) ? data.maps : []) {
-      const m = coerceLoadedMap(gm)
-      if (m) maps.set(m.id, m)
-    }
-    if (maps.size === 0) {
-      const m = makeMap('맵 1')
-      maps.set(m.id, m)
-    }
-    room.maps = maps
-    room.activeMapId =
-      typeof data.activeMapId === 'string' && maps.has(data.activeMapId)
-        ? data.activeMapId
-        : (maps.keys().next().value as string)
-    const handouts = new Map<string, Handout>()
-    for (const h of Array.isArray(data.handouts) ? data.handouts : []) {
-      const c = coerceLoadedHandout(h)
-      if (c) handouts.set(c.id, c)
-    }
-    room.handouts = handouts
-    room.appearance = normalizeAppearance(data.appearance)
-    room.bgm = coerceLoadedBgmList(data.bgm)
-    room.lastActivityAt = Date.now()
-    return true
-  }
-
-  /** 서버 권위 메시지 누적 (id/time 은 호출 측에서 이미 스탬프). */
-  addMessage(roomId: string, message: ChatMessage): void {
-    const room = this.rooms.get(roomId)
-    if (!room) return
-    room.messages.push(message)
-    this.evictOldest(room, MAX_HISTORY) // 넘치는 앞부분은 버리지 않고 보관소로
-    room.lastActivityAt = Date.now()
-    this.journal(roomId, { op: 'add', m: message })
-  }
-
-  /**
-   * 채팅 메시지 수정 — 작성자 본인 또는 GM. 텍스트 메시지(speech/narration/script)만 수정 가능.
-   * 성공 시 갱신된 메시지 반환(브로드캐스트용), 미존재·권한 없음·비텍스트면 undefined.
-   */
-  editMessage(
-    roomId: string,
-    id: string,
-    text: string,
-    byPlayerId: string,
-    isGM: boolean
-  ): ChatMessage | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const msg = room.messages.find((m) => m.id === id)
-    if (!msg || msg.deleted) return undefined
-    if (msg.playerId !== byPlayerId && !isGM) return undefined // 작성자 또는 GM 만
-    if (msg.kind !== 'speech' && msg.kind !== 'narration' && msg.kind !== 'script') return undefined // 텍스트만
-    msg.text = text
-    msg.edited = true
-    room.lastActivityAt = Date.now()
-    this.journal(roomId, { op: 'edit', id, text })
-    return msg
-  }
-
-  /** 채팅 메시지 삭제 — GM 만. 툼스톤("삭제된 메시지") 없이 히스토리에서 완전 제거(깔끔 삭제). 성공 시 id 반환. */
-  deleteMessage(roomId: string, id: string, isGM: boolean): string | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || !isGM) return undefined
-    const i = room.messages.findIndex((m) => m.id === id)
-    if (i < 0) return undefined
-    room.messages.splice(i, 1) // 완전 제거(스냅샷·히스토리에 흔적 없음)
-    room.lastActivityAt = Date.now()
-    this.journal(roomId, { op: 'del', id })
-    return id
-  }
-
-  /**
-   * 캐릭터 프레즌스 서브셋 보관/갱신(char 의 playerId 는 호출 측에서 서버 권위로 스탬프됨).
-   * 표정 인덱스는 standings 범위로 보정해 저장. 저장본 반환.
-   */
-  setCharacter(roomId: string, char: SharedCharacter): SharedCharacter | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    // 이미지 필드 캡(개수·크기) + 텍스트 길이 바운드 — 신뢰 못 할 클라 페이로드 방어.
-    const standings = capImageList(char.standings)
-    const headshots = char.headshots ? capImageList(char.headshots) : undefined
-    const max = Math.max(0, standings.length - 1)
-    const currentExpression = Math.min(Math.max(0, char.currentExpression), max)
-    const stored: SharedCharacter = {
-      ...char,
-      charId: capId(char.charId) ?? '',
-      name: typeof char.name === 'string' ? char.name.slice(0, 100) : '',
-      color: typeof char.color === 'string' ? char.color.slice(0, 32) : '#7c9cff',
-      nameColor: typeof char.nameColor === 'string' ? char.nameColor.slice(0, 32) : undefined,
-      headshot: capImage(char.headshot),
-      standings,
-      headshots,
-      currentExpression,
-      // 스탠딩 표시 높이(px) — 유한수만, 40~4000 으로 클램프. 비유한/미설정은 undefined(기본 92%).
-      standingHeight:
-        typeof char.standingHeight === 'number' && Number.isFinite(char.standingHeight)
-          ? Math.min(4000, Math.max(40, Math.round(char.standingHeight)))
-          : undefined,
-      bio: typeof char.bio === 'string' ? char.bio.slice(0, 500) : undefined // 자기소개 길이 바운드
-    }
-    room.characters.set(char.playerId, stored)
-    // 지금 장착한 캐릭터는 곧 갈아입히면 로스터에서 밀려난다. 맵에 토큰을 놓아 둔 캐릭터가 그때
-    // 이름·색·두상·수치를 잃지 않도록, 캐릭터별로도 한 벌 남겨 둔다(같은 값의 사본).
-    if (stored.charId) this.setPooledCharacter(room, stored)
-    room.lastActivityAt = Date.now()
-    return stored
-  }
-
-  /**
-   * 캐릭터 보관대 — (playerId, charId) 로 색인한다. 로스터가 '지금 말하는 캐릭터' 한 명만 담는 것과 달리,
-   * 여기에는 이 방에서 쓰인 적 있는 캐릭터가 함께 남는다. 맵 토큰이 charId 로 자기 캐릭터를 찾을 때 본다.
-   */
-  private setPooledCharacter(room: Room, char: SharedCharacter): void {
-    const key = poolKey(char.playerId, char.charId)
-    if (!key) return
-    // 지운 뒤 다시 넣어 '가장 최근'이 맨 뒤로 가게 한다 — Map 은 이미 있는 키를 덮어써도 자리를 안 바꾼다.
-    // 그대로 두면 아래 축출이 '오래 안 쓴 것'이 아니라 '먼저 담긴 것'을 버려, 지금 쓰는 캐릭터가 밀려난다.
-    room.charPool.delete(key)
-    // 1인당 할당량부터 정리한다 — 넘치는 몫은 그 사람의 가장 오래된 자기 항목에서만 걷어,
-    // 한 사람의 등록 폭주가 남의 보관대를 밀어내지 못하게 한다(방 공용 상한은 마지막 방어선).
-    const head = char.playerId.length + ':' + char.playerId
-    const mine = [...room.charPool.keys()].filter((k) => k.startsWith(head))
-    for (let i = 0; i <= mine.length - MAX_CHAR_POOL_PER_PLAYER; i++) room.charPool.delete(mine[i])
-    room.charPool.set(key, poolSubset(char))
-    trimCharPool(room)
-  }
-
-  /** 방을 아주 떠난 사람의 보관대 몫을 걷는다(재접속이 아니라 멤버십이 끊긴 경우). */
-  private dropPooledFor(room: Room, playerId: string): void {
-    const head = playerId.length + ':' + playerId
-    for (const k of [...room.charPool.keys()]) if (k.startsWith(head)) room.charPool.delete(k)
-  }
-
-  /** 보관대에 담긴 캐릭터 전부(스냅샷·입장 전달용). */
-  charPool(roomId: string): SharedCharacter[] {
-    const room = this.rooms.get(roomId)
-    return room ? [...room.charPool.values()] : []
-  }
-
-  /**
-   * 보관대에서 한 사람의 캐릭터 한 벌을 찾는다 — 메시지에 실려 온 charId 를 화자로 각인할 때 쓴다.
-   * 키가 (playerId, charId) 라 남의 캐릭터는 애초에 닿지 않는다.
-   */
-  pooledCharacter(roomId: string, playerId: string, charId: string): SharedCharacter | undefined {
-    const room = this.rooms.get(roomId)
-    return room?.charPool.get(poolKey(playerId, charId))
-  }
-
-  /**
-   * 장착 슬롯(room.characters)은 건드리지 않고 보관대에만 담는다 — 분리 창이 제 화자를 등록하는 길.
-   * 값 깎기(이미지 캡·길이 바운드)는 setCharacter 와 같은 규칙을 태워야 하므로 여기서 직접 한다.
-   */
-  poolCharacter(roomId: string, char: SharedCharacter): SharedCharacter | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const standings = capImageList(char.standings)
-    const max = Math.max(0, standings.length - 1)
-    const stored: SharedCharacter = {
-      ...char,
-      charId: capId(char.charId) ?? '',
-      name: typeof char.name === 'string' ? char.name.slice(0, 100) : '',
-      color: typeof char.color === 'string' ? char.color.slice(0, 32) : '#7c9cff',
-      nameColor: typeof char.nameColor === 'string' ? char.nameColor.slice(0, 32) : undefined,
-      headshot: capImage(char.headshot),
-      headshots: char.headshots ? capImageList(char.headshots) : undefined,
-      standings,
-      currentExpression: Math.min(Math.max(0, char.currentExpression), max),
-      standingHeight:
-        typeof char.standingHeight === 'number' && Number.isFinite(char.standingHeight)
-          ? Math.min(4000, Math.max(40, Math.round(char.standingHeight)))
-          : undefined
-    }
-    if (!stored.charId) return undefined
-    this.setPooledCharacter(room, stored)
-    room.lastActivityAt = Date.now()
-    return room.charPool.get(poolKey(stored.playerId, stored.charId))
-  }
-
-  /**
-   * 스탠딩을 뺀 정체성만 갱신(가벼운 발행). 같은 캐릭터를 계속 쓰는 중이면 보관 중인 스탠딩을 그대로 두고,
-   * 다른 캐릭터로 갈아입었으면 옛 스탠딩을 비운다(남겨 두면 무대에 엉뚱한 캐릭터의 그림이 선다).
-   * 비운 자리는 뒤이어 오는 char:update 가 채운다. 보관본이 아직 없으면 스탠딩 없는 상태로 새로 만든다.
-   */
-  mergeIdentity(roomId: string, ident: Omit<SharedCharacter, 'standings'>): SharedCharacter | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const prev = room.characters.get(ident.playerId)
-    const sameChar = !!prev && prev.charId === (capId(ident.charId) ?? '')
-    return this.setCharacter(roomId, {
-      ...ident,
-      standings: sameChar ? prev.standings : [],
-      // 표정은 남는 스탠딩 범위 안에서만 뜻이 있다 — 갈아입은 직후엔 0 으로(setCharacter 가 다시 보정).
-      currentExpression: sameChar ? ident.currentExpression : 0
-    })
-  }
-
-  /** 표정 인덱스만 갱신(잦은 변경). 보정된 인덱스 반환, 보관된 캐릭터 없으면 undefined. */
-  setExpression(roomId: string, playerId: string, index: number): number | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const char = room.characters.get(playerId)
-    if (!char) return undefined
-    const max = Math.max(0, char.standings.length - 1)
-    char.currentExpression = Math.min(Math.max(0, index), max)
-    // 표정은 보관대 사본에도 따라 붙인다 — 사본이 낡으면 이 캐릭터를 charId 로 각인한 다음 말의
-    // 두상이 옛 표정으로 남는다(잦은 전환이지만 사본 교체는 Map 두 번 손대는 값싼 일).
-    if (char.charId) this.setPooledCharacter(room, char)
-    room.lastActivityAt = Date.now()
-    return char.currentExpression
-  }
-
-  // ===== 핸드아웃 =====
-  /**
-   * 핸드아웃 생성/갱신. id 없으면 신규(randomUUID·createdAt), 있으면 기존 갱신(updatedAt 만 새로).
-   * 저장본과 갱신 전 스냅샷(prev, 신규면 undefined)을 함께 반환 — 라우팅 대상 diff(가시성 변화)용.
-   */
-  upsertHandout(roomId: string, req: HandoutUpsertReq): { handout: Handout; prev?: Handout } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const now = Date.now()
-    const existing = typeof req.id === 'string' ? room.handouts.get(req.id) : undefined
-    const scope: HandoutScope = req.scope === 'all' || req.scope === 'targeted' ? req.scope : 'private'
-    // 정렬 키는 요청으로 안 받는다(재배치는 handout:reorder 전용) — 기존 값 보존, 신규는 맨 끝.
-    // 키 없는 옛 핸드아웃은 createdAt 으로 정렬되므로 최댓값은 sortKey·createdAt 을 함께 본다.
-    let sortKey = existing?.sortKey
-    if (!existing) {
-      let max = 0
-      for (const h of room.handouts.values()) {
-        if (typeof h.sortKey === 'number' && h.sortKey > max) max = h.sortKey
-        if (h.createdAt > max) max = h.createdAt
-      }
-      sortKey = max + 1
-    }
-    const handout: Handout = {
-      // 기존이면 그 id 유지, 신규면 클라 제공 id 존중(GM 전용 경로 — 낙관적 선택용), 없으면 생성.
-      id: existing?.id ?? (typeof req.id === 'string' && req.id ? req.id : randomUUID()),
-      title: typeof req.title === 'string' ? req.title.slice(0, 200) : '',
-      body: typeof req.body === 'string' ? req.body.slice(0, 20000) : '',
-      image: capImage(req.image),
-      imageAlign: req.imageAlign === 'center' || req.imageAlign === 'right' ? req.imageAlign : undefined,
-      // 빈 문자열은 폴더 해제. 키가 아예 없으면 기존 폴더 유지(옛 클라 요청이 폴더를 걷어내지 않게).
-      folder:
-        typeof req.folder === 'string' ? req.folder.trim().slice(0, 60) || undefined : existing?.folder,
-      sortKey,
-      tags: Array.isArray(req.tags) ? req.tags.filter((t) => typeof t === 'string').slice(0, 40) : [],
-      scope,
-      targets:
-        scope === 'targeted' && Array.isArray(req.targets)
-          ? req.targets.filter((t) => typeof t === 'string').slice(0, 200)
-          : [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    }
-    const prev = existing ? { ...existing } : undefined
-    room.handouts.set(handout.id, handout)
-    room.lastActivityAt = now
-    return { handout, prev }
-  }
-
-  /** 핸드아웃 삭제. 삭제된 핸드아웃(라우팅용 prev) 반환, 없으면 undefined. */
-  deleteHandout(roomId: string, id: string): Handout | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const prev = room.handouts.get(id)
-    if (!prev) return undefined
-    room.handouts.delete(id)
-    room.lastActivityAt = Date.now()
-    return prev
-  }
-
-  /**
-   * 핸드아웃 순서 변경 — 대상을 beforeId 앞(없으면 맨 끝)으로. 전체를 (sortKey ?? createdAt)
-   * 오름차순으로 놓고 이웃 둘의 중간값을 새 키로 준다. 중간값이 이웃과 같아질 만큼 간격이
-   * 좁아지면 전체를 0..n 으로 재번호. 반환은 키가 바뀐 핸드아웃들(평소 1개 · 재번호 시 전부) —
-   * 호출 측이 그대로 재방송한다. 방·대상이 없으면 undefined.
-   */
-  reorderHandout(roomId: string, id: string, beforeId?: string): Handout[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const target = room.handouts.get(id)
-    if (!target) return undefined
-    if (beforeId === id) return [] // 자기 앞으로 = 제자리
-    const keyOf = (h: Handout): number => h.sortKey ?? h.createdAt
-    const rest = [...room.handouts.values()]
-      .filter((h) => h.id !== id)
-      .sort((a, b) => keyOf(a) - keyOf(b) || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
-    const at = typeof beforeId === 'string' ? rest.findIndex((h) => h.id === beforeId) : -1
-    const idx = at === -1 ? rest.length : at // beforeId 없음(삭제됨 포함)=맨 끝
-    const prev = idx > 0 ? keyOf(rest[idx - 1]) : undefined
-    const next = idx < rest.length ? keyOf(rest[idx]) : undefined
-    let key: number
-    if (prev !== undefined && next !== undefined) key = (prev + next) / 2
-    else if (next !== undefined) key = next - 1
-    else if (prev !== undefined) key = prev + 1
-    else key = 0 // 혼자 남은 목록 — 어떤 키든 무방
-    room.lastActivityAt = Date.now()
-    // 간격 소진 — 중간값이 이웃과 겹치면(부동소수 정밀도 바닥) 새 차례대로 전체 재번호.
-    if (key === prev || key === next) {
-      rest.splice(idx, 0, target)
-      rest.forEach((h, i) => {
-        h.sortKey = i
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, account: r.account }))
       })
-      return rest
+      return
     }
-    target.sortKey = key
-    return [target]
-  }
 
-  getHandout(roomId: string, id: string): Handout | undefined {
-    return this.rooms.get(roomId)?.handouts.get(id)
-  }
-
-  /** viewer 가 볼 수 있는 핸드아웃만 반환. */
-  handoutsFor(room: Room, viewer: { playerId: string; role: Participant['role'] }): Handout[] {
-    return [...room.handouts.values()].filter((h) => canViewHandout(h, viewer))
-  }
-
-  // ===== 맵·토큰 (다중 맵) =====
-  getMap(roomId: string, mapId: string): RoomMap | undefined {
-    return this.rooms.get(roomId)?.maps.get(mapId)
-  }
-
-  /**
-   * 새 맵 생성. 저장본(와이어) + 표시 맵 목록이 바뀐 통합 토큰들을 함께 반환(방 없으면 undefined).
-   *
-   * 가져오기로 들어온 통합 레이어에는 '이 맵들에서만 보임'(mapIds)이 박혀 있다. 그래서 새 맵세트를
-   * 만들 때 이어받지 않으면 통합 레이어가 아무것도 안 보이는 빈 판이 나온다 — 바로 아래 duplicateMap
-   * 과 짝을 맞춘다. 만든 사람이 보고 있던 맵에 보이던 것만 이어받는다(전부 이어받으면 서로 다른
-   * 배치를 두 번 가져온 방에서 새 맵에 두 배치가 겹쳐 쏟아진다).
-   *
-   * ⚠ 기준 맵은 부르는 쪽이 알려 준다(baseMapId). 맵 전환은 개인 뷰라 room.activeMapId 는 전원 강제
-   *   이동 때만 움직이므로, 그 값을 기준으로 삼으면 만든 사람 화면과 다른 맵에서 이어받는다 —
-   *   클라 미러는 자기 화면 기준으로 이어붙이므로 두 쪽이 서로 다른 결과를 갖게 된다.
-   */
-  createMap(roomId: string, name?: string, baseMapId?: string): { map: GameMap; touchedGlobals: Token[] } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const m = makeMap((name ?? '').trim() || `맵 ${room.maps.size + 1}`)
-    // 알려 준 기준 맵이 실재할 때만 쓴다(구버전 클라·잘못된 id 는 종전대로 활성 맵).
-    const base = baseMapId && room.maps.has(baseMapId) ? baseMapId : room.activeMapId
-    const touchedGlobals: Token[] = []
-    for (const t of room.globalTokens?.values() ?? []) {
-      if (t.mapIds?.includes(base)) {
-        t.mapIds = [...t.mapIds, m.id]
-        touchedGlobals.push(t)
-      }
-    }
-    room.maps.set(m.id, m)
-    room.lastActivityAt = Date.now()
-    return { map: toWireMap(m), touchedGlobals }
-  }
-
-  /** 맵세트 복제(GM 전용). 원본의 배경/바탕/그리드/토큰/드로잉/텍스트/메타를 새 맵으로 깊은 복사(토큰 등은 새 id). */
-  duplicateMap(roomId: string, mapId: string): { map: GameMap; touchedGlobals: Token[] } | undefined {
-    const room = this.rooms.get(roomId)
-    const src = room?.maps.get(mapId)
-    if (!room || !src) return undefined
-    const m: RoomMap = {
-      id: randomUUID(),
-      name: src.name + ' 복사',
-      background: src.background ? { ...src.background } : null,
-      grid: { ...src.grid },
-      tokens: new Map(),
-      drawings: new Map(),
-      texts: new Map(),
-      vnBackground: src.vnBackground,
-      vnBackgroundBlur: src.vnBackgroundBlur,
-      vnLayers: src.vnLayers ? src.vnLayers.map((l) => ({ ...l })) : undefined,
-      bgColor: src.bgColor,
-      backdrop: src.backdrop ? { ...src.backdrop } : undefined,
-      crossfade: src.crossfade,
-      hiddenLayers: src.hiddenLayers ? [...src.hiddenLayers] : undefined,
-      bgm: src.bgm ? src.bgm.map((t) => ({ ...t })) : undefined,
-      importId: src.importId // 복제본이 남아 있는 동안 가져오기 배치가 살아 있게(연동 삭제 보수적)
-    }
-    for (const t of src.tokens.values()) {
-      const id = randomUUID()
-      m.tokens.set(id, { ...t, id })
-    }
-    for (const s of src.drawings.values()) {
-      const id = randomUUID()
-      m.drawings.set(id, { ...s, id })
-    }
-    for (const tx of src.texts.values()) {
-      const id = randomUUID()
-      m.texts.set(id, { ...tx, id })
-    }
-    // 표시 맵 제한 통합 토큰 — 원본 맵에 표시되던 배치는 복제 맵에서도 보이게 새 id 를 추가.
-    const touchedGlobals: Token[] = []
-    for (const t of room.globalTokens?.values() ?? []) {
-      if (t.mapIds?.includes(mapId)) {
-        t.mapIds = [...t.mapIds, m.id]
-        touchedGlobals.push(t)
-      }
-    }
-    room.maps.set(m.id, m)
-    room.lastActivityAt = Date.now()
-    return { map: toWireMap(m), touchedGlobals }
-  }
-
-  /** 맵 삭제(마지막 1개는 삭제 불가). 활성 맵 삭제 시 다른 맵으로 전환. {removed,activeMapId} 반환. */
-  deleteMap(roomId: string, mapId: string): { removed: string; activeMapId: string } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || !room.maps.has(mapId) || room.maps.size <= 1) return undefined
-    room.maps.delete(mapId)
-    if (room.activeMapId === mapId) room.activeMapId = room.maps.keys().next().value as string
-    room.lastActivityAt = Date.now()
-    return { removed: mapId, activeMapId: room.activeMapId }
-  }
-
-  /** 맵 이름 변경. {mapId,name} 반환, 맵 없으면 undefined. */
-  /**
-   * 맵세트 일괄 가져오기(GM 전용 — 권한 검증은 relay). 외부 파일에서 변환한 맵들을 coerceLoadedMap 으로
-   * 정규화(이미지 캡·좌표 클램프 등)하고 새 id 를 부여해 추가한다. 방 전체 맵 상한 100·1회 60개로 제한.
-   * 생성된 wire 맵 목록 반환(relay 가 map:added 로 브로드캐스트).
-   */
-  importMaps(roomId: string, mapsData: unknown): GameMap[] {
-    const room = this.rooms.get(roomId)
-    if (!room) return []
-    const budget = Math.max(0, 100 - room.maps.size)
-    const list = Array.isArray(mapsData) ? mapsData.slice(0, Math.min(60, budget)) : []
-    const created: GameMap[] = []
-    for (const raw of list) {
-      if (!raw || typeof raw !== 'object') continue
-      const m = coerceLoadedMap({ ...(raw as Record<string, unknown>), id: randomUUID() })
-      if (!m) continue
-      room.maps.set(m.id, m)
-      created.push(toWireMap(m))
-    }
-    if (created.length) room.lastActivityAt = Date.now()
-    return created
-  }
-
-  /**
-   * 통합 레이어 일괄 가져오기(GM 전용 — 권한 검증은 relay). 맵세트 가져오기에 동반된 방 상주 패널을
-   * coerceToken 으로 정규화하고 새 id 를 부여해 통합 레이어에 추가한다 — 낱개 upsert 는 z 를 레이어
-   * 맨 앞으로 재배열해 무대 뒤(z<0) 배치가 소실되므로 z 를 보존하는 일괄 경로가 따로 필요하다.
-   * 1회 100개, 총량은 맵당 토큰 상한과 동일. 저장 토큰 목록 반환(relay 가 token:state 로 브로드캐스트).
-   * restrictMapIds: 표시 맵 제한 덮어쓰기 — importMaps 가 맵 id 를 재발급하므로 클라가 찍어 보낸
-   * 옛 id 대신 실제 생성된 맵 id 로 서버가 다시 묶는다(배치의 통합 레이어는 그 맵들에서만 표시).
-   */
-  importGlobalTokens(roomId: string, tokensData: unknown, restrictMapIds?: string[]): Token[] {
-    const room = this.rooms.get(roomId)
-    if (!room) return []
-    const coll = (room.globalTokens ??= new Map<string, Token>())
-    const list = Array.isArray(tokensData) ? tokensData.slice(0, 100) : []
-    const stored: Token[] = []
-    for (const raw of list) {
-      if (coll.size >= MAX_TOKENS_PER_MAP) break
-      if (!raw || typeof raw !== 'object') continue
-      const t = coerceToken({ ...(raw as Record<string, unknown>), id: randomUUID() })
-      if (!t) continue
-      // 표시 맵 제한은 서버가 항상 재부여 — 클라가 찍어 보낸 로컬 맵 id 는 재발급 전 값이라
-      // 그대로 두면 어떤 맵에도 안 보이는 유령 토큰이 된다(맵이 안 들어왔으면 전체 표시로 해제).
-      t.mapIds = restrictMapIds?.length ? restrictMapIds : undefined
-      coll.set(t.id, t)
-      stored.push(t)
-    }
-    if (stored.length) room.lastActivityAt = Date.now()
-    return stored
-  }
-
-  renameMap(roomId: string, mapId: string, name: string): { mapId: string; name: string } | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return undefined
-    m.name = (typeof name === 'string' ? name.trim() : '') || m.name
-    room.lastActivityAt = Date.now()
-    return { mapId, name: m.name }
-  }
-
-  /** 활성 맵 전환. 새 활성 id 반환, 맵 없으면 undefined. */
-  setActiveMap(roomId: string, mapId: string): string | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || !room.maps.has(mapId)) return undefined
-    room.activeMapId = mapId
-    room.lastActivityAt = Date.now()
-    return mapId
-  }
-
-  // ===== 저장 슬롯 (반면 전체 명명 저장 · GM · 최대 3 · 영속) =====
-  private slotMeta(room: Room): SaveSlotMeta[] {
-    return (room.saveSlots ?? []).map((s) => ({ id: s.id, name: s.name, savedAt: s.savedAt }))
-  }
-  saveSlotsMeta(roomId: string): SaveSlotMeta[] {
-    const room = this.rooms.get(roomId)
-    return room ? this.slotMeta(room) : []
-  }
-  /** 현재 반면(맵·활성맵·BGM)을 명명 슬롯으로 저장(GM). 같은 이름이면 덮어쓰기, 아니면 추가(최대 3). 꽉 차면 undefined. */
-  saveSlot(roomId: string, name: unknown): SaveSlotMeta[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const slots = room.saveSlots ?? []
-    const nm = (typeof name === 'string' ? name.trim() : '').slice(0, 60) || `저장 ${slots.length + 1}`
-    const slot: SaveSlot = {
-      id: randomUUID(),
-      name: nm,
-      savedAt: Date.now(),
-      maps: [...room.maps.values()].map(toWireMap),
-      activeMapId: room.activeMapId,
-      bgm: room.bgm.map((t) => ({ ...t })),
-      // 통합 레이어도 반면의 일부 — 함께 저장해야 로드 시 가져오기 배치의 맵·패널 짝이 유지된다.
-      globalTokens: room.globalTokens ? [...room.globalTokens.values()].map((t) => ({ ...t })) : []
-    }
-    const i = slots.findIndex((s) => s.name === nm)
-    if (i >= 0) {
-      slot.id = slots[i].id
-      slots[i] = slot // 같은 이름 덮어쓰기
-    } else {
-      if (slots.length >= 3) return undefined // 최대 3 슬롯
-      slots.push(slot)
-    }
-    room.saveSlots = slots
-    room.lastActivityAt = Date.now()
-    return this.slotMeta(room)
-  }
-  /** 슬롯 로드 — 저장된 맵·활성맵·BGM 으로 반면 복원(GM). 성공 시 true(호출측이 전원 재싱크). */
-  loadSlot(roomId: string, slotId: string): boolean {
-    const room = this.rooms.get(roomId)
-    const slot = room?.saveSlots?.find((s) => s.id === slotId)
-    if (!room || !slot) return false
-    const maps = new Map<string, RoomMap>()
-    for (const g of slot.maps) {
-      const m = coerceLoadedMap(g) // 깊은 복사·정규화
-      if (m) maps.set(m.id, m)
-    }
-    if (!maps.size) return false
-    room.maps = maps
-    room.activeMapId = maps.has(slot.activeMapId)
-      ? slot.activeMapId
-      : (maps.keys().next().value as string)
-    room.bgm = slot.bgm.map((t) => ({ ...t }))
-    // 통합 레이어도 저장 시점으로 복원(반면 통째 교체와 정합·배치 짝 유지).
-    // 구버전 슬롯(필드 없음)은 현재 통합 레이어를 유지한다.
-    if (slot.globalTokens !== undefined)
-      room.globalTokens = coerceGlobalTokens(slot.globalTokens) ?? new Map<string, Token>()
-    room.lastActivityAt = Date.now()
-    return true
-  }
-  /** 슬롯 삭제(GM). 삭제 후 메타 목록 반환. */
-  deleteSlot(roomId: string, slotId: string): SaveSlotMeta[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.saveSlots = (room.saveSlots ?? []).filter((s) => s.id !== slotId)
-    room.lastActivityAt = Date.now()
-    return this.slotMeta(room)
-  }
-
-  // ===== 비주얼 카드 — GM 등록·전원 동기화 · 영속 =====
-  /** 카드 추가/갱신(GM). id 있으면 갱신, 없으면 신규(MAX_VISUAL_CARDS 까지). 이미지·음향 둘 다 없으면 무시. 정규화 목록 반환. */
-  setVisualCard(roomId: string, req: unknown): VisualCard[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || !req || typeof req !== 'object') return undefined
-    const o = req as Record<string, unknown>
-    const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 40)
-    if (!name) return undefined
-    const image = capImage(o.image)
-    const sound = capImage(o.sound)
-    if (!image && !sound) return undefined
-    const cards = room.visualCards ?? []
-    const id = typeof o.id === 'string' && o.id ? o.id.slice(0, 60) : undefined
-    const i = id ? cards.findIndex((c) => c.id === id) : -1
-    const card: VisualCard = {
-      id: id && i >= 0 ? id : randomUUID(),
-      name,
-      image,
-      sound,
-      soundSec: coerceSoundSec(o.soundSec, sound),
-      displaySec: coerceDisplaySec(o.displaySec, image),
-      for: coerceCardSpeakers(o.for)
-    }
-    if (i >= 0) cards[i] = card
-    else {
-      if (cards.length >= MAX_VISUAL_CARDS) return undefined
-      cards.push(card)
-    }
-    room.visualCards = cards
-    room.lastActivityAt = Date.now()
-    return cards
-  }
-  /** 카드 삭제(GM). 삭제 후 목록 반환. */
-  deleteVisualCard(roomId: string, cardId: string): VisualCard[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    room.visualCards = (room.visualCards ?? []).filter((c) => c.id !== cardId)
-    room.lastActivityAt = Date.now()
-    return room.visualCards
-  }
-
-  // ===== 덱(카드 뭉치 · GM 이 만들고 방 전원이 뽑는다 — 권한 검증은 호출 측 relay) =====
-  /** 이 방의 덱 목록. 뷰어를 주면 그 사람에게 보일 몫으로, 주지 않으면 가장 좁게(감춘 덱은 카드·버린 더미를 비워) 내보낸다. */
-  decksFor(roomId: string, viewer?: { role: Participant['role']; playerId?: string }): DeckView[] {
-    return (this.rooms.get(roomId)?.decks ?? []).map((d) => deckView(d, viewer))
-  }
-
-  /** 덱 하나 찾기(내부 보관본) — 뽑기 권한 판정에 쓴다. */
-  getDeck(roomId: string, deckId: string): Deck | undefined {
-    return this.rooms.get(roomId)?.decks?.find((d) => d.id === deckId)
-  }
-
-  /**
-   * 덱 만들기/고치기(GM). id 없으면 새 덱.
-   *
-   * 카드 구성이 달라졌을 때만 더미를 다시 섞는다 — 이름이나 설정만 고쳤는데 진행 중인 판이
-   * 처음으로 되돌아가면 곤란하기 때문이다. 상한을 넘으면 undefined(호출 측이 조용히 무시).
-   */
-  upsertDeck(roomId: string, req: DeckUpsertReq): Deck | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const name = (typeof req?.name === 'string' ? req.name.trim() : '').slice(0, 40)
-    if (!name) return undefined
-    const cards = coerceDeckCards(req.cards)
-    if (!cards.length) return undefined
-    const decks = room.decks ?? []
-    const id = capId(req.id)
-    const at = id ? decks.findIndex((d) => d.id === id) : -1
-    const prev = at >= 0 ? decks[at] : undefined
-    if (!prev && decks.length >= MAX_DECKS) return undefined
-
-    /** 카드 구성이 그대로인지 — 장수까지 같아야 '안 바뀐 것'으로 본다. */
-    const sameCards =
-      !!prev &&
-      prev.cards.length === cards.length &&
-      prev.cards.every((c, i) => c.id === cards[i].id && (c.count ?? 1) === (cards[i].count ?? 1))
-
-    const deck: Deck = {
-      id: prev?.id ?? id ?? randomUUID(),
-      name,
-      cards,
-      draw: sameCards ? prev.draw : shufflePile(deckPile(cards)),
-      discard: sameCards ? prev.discard : [],
-      announce: req.announce !== false,
-      reshuffle: req.reshuffle === true,
-      revealCards: req.revealCards !== false,
-      who: req.who === 'gm' ? 'gm' : 'all',
-      createdAt: prev?.createdAt ?? Date.now()
-    }
-    if (at >= 0) decks[at] = deck
-    else decks.push(deck)
-    room.decks = decks
-    room.lastActivityAt = Date.now()
-    return deck
-  }
-
-  /** 덱 삭제(GM). 지웠으면 true. */
-  deleteDeck(roomId: string, deckId: string): boolean {
-    const room = this.rooms.get(roomId)
-    if (!room?.decks) return false
-    const next = room.decks.filter((d) => d.id !== deckId)
-    if (next.length === room.decks.length) return false
-    room.decks = next.length ? next : undefined
-    room.lastActivityAt = Date.now()
-    return true
-  }
-
-  /** 다시 섞기(GM) — 버린 더미까지 걷어 한 벌을 새로 섞는다. */
-  shuffleDeck(roomId: string, deckId: string): Deck | undefined {
-    const room = this.rooms.get(roomId)
-    const deck = room?.decks?.find((d) => d.id === deckId)
-    if (!room || !deck) return undefined
-    deck.draw = shufflePile(deckPile(deck.cards))
-    deck.discard = []
-    room.lastActivityAt = Date.now()
-    return deck
-  }
-
-  /**
-   * 뽑기 — 서버가 더미에서 꺼낸다.
-   *
-   * 클라이언트가 결과를 만들어 보내는 방식이면 남은 장수를 무시하고 얼마든지 뽑아낼 수 있고,
-   * 여러 사람이 같은 순간에 뽑으면 같은 카드가 두 번 나온다. 그래서 더미도 뽑기도 서버에만 둔다.
-   * 더미가 모자라면 있는 만큼만 준다(자동 섞기가 켜져 있으면 걷어서 다시 섞고 이어 뽑는다).
-   */
-  drawFromDeck(
-    roomId: string,
-    deckId: string,
-    count: number,
-    /** '비밀로' 뽑았으면 뽑은 사람 playerId — 버린 더미에 각인해 그 사람과 GM 에게만 보인다. */
-    secretBy?: string
-  ): { deck: Deck; cards: DeckCard[] } | undefined {
-    const room = this.rooms.get(roomId)
-    const deck = room?.decks?.find((d) => d.id === deckId)
-    if (!room || !deck) return undefined
-    const want = Math.max(1, Math.min(MAX_DECK_DRAW, Math.round(count) || 1))
-    const byId = new Map(deck.cards.map((c) => [c.id, c]))
-    const drawn: DeckCard[] = []
-    for (let i = 0; i < want; i++) {
-      if (!deck.draw.length) {
-        if (!deck.reshuffle || !deck.cards.length) break
-        // 자동 섞기 — 카드 정의에서 한 벌을 새로 만들어 섞고 버린 더미를 비운다(discard 를 걷어 쓰지 않는다).
-        // 정의가 하나도 없으면 만들 것이 없어 여기서 끝난다.
-        deck.draw = shufflePile(deckPile(deck.cards))
-        deck.discard = []
-      }
-      const id = deck.draw.pop()
-      if (!id) break
-      const card = byId.get(id)
-      if (!card) continue // 정의가 사라진 유령 카드는 조용히 건너뛴다
-      deck.discard.push(secretBy ? { id, by: secretBy } : { id })
-      drawn.push(card)
-    }
-    if (!drawn.length) return undefined
-    room.lastActivityAt = Date.now()
-    return { deck, cards: drawn }
-  }
-
-  /**
-   * 이번 발화에서 볼 카드 뭉치를 둘로 나눈다 — [이 화자에게 매어 둔 것, 누구에게나 열린 것].
-   *
-   * ⚠ 나누는 일이 먼저고 고르는 일이 나중이다. 이름 구체성으로 한 장을 먼저 뽑고 나서 화자를
-   *    걸러 내면, 공용 '대성공' 카드가 이겨서 뽑힌 뒤 그 자리에서 탈락해 **아무것도 안 뜬다**.
-   *    화자에게 매어 둔 카드가 하나라도 걸리면 공용은 아예 보지 않는다.
-   */
-  private cardTiers(roomId: string, sp?: CardSpeaker): [VisualCard[], VisualCard[]] {
-    const cards = this.rooms.get(roomId)?.visualCards
-    if (!cards?.length) return [[], []]
-    const key = poolKey(sp?.playerId, sp?.charId)
-    const mine: VisualCard[] = []
-    const shared: VisualCard[] = []
-    for (const c of cards) {
-      if (!c.for?.length) shared.push(c)
-      // 화자를 알 수 없는 발화(GM 의 1회성 NPC·charId 를 안 싣는 옛 클라)는 열쇠가 빈 문자열이라
-      // 어느 화자 카드에도 걸리지 않는다 — 공용 카드만 뜬다. '모르면 통과'로 두면 매어 둔 뜻이 없어진다.
-      else if (key && c.for.includes(key)) mine.push(c)
-    }
-    return [mine, shared]
-  }
-
-  /** 다이스 결과 라벨로 카드 찾기 — 라벨('대성공' 등)이 카드 이름과 정확히 일치하면 그 카드(트리거용). */
-  findCardByTitle(roomId: string, text: string, sp?: CardSpeaker): VisualCard | undefined {
-    const t = text.trim()
-    if (!t) return undefined
-    for (const tier of this.cardTiers(roomId, sp)) {
-      const hit = tier.find((c) => c.name === t)
-      if (hit) return hit
-    }
-    return undefined
-  }
-
-  /**
-   * 판정 결과로 카드 찾기 — 이름이 딱 떨어지지 않아도 발동한다.
-   *
-   * 카드 이름이 '성공' 처럼 결과 라벨과 **정확히 같아야만** 뜨게 두면, GM 이 '성공 컷인'·'대성공!'
-   * 처럼 지은 카드는 영영 안 떠서 판정 컷인은 사실상 못 쓰고 텍스트로 부르는 길만 남는다.
-   *
-   * 그래서 '이름에 그 라벨이 들어 있으면' 발동으로 넓히되, 한 가지를 지킨다: '대성공!' 은 '성공'
-   * 카드로도 읽히므로, 카드마다 **이름에 들어 있는 라벨 중 가장 긴 것**을 그 카드의 뜻으로 보고
-   * 그것이 이번 결과의 라벨일 때만 튼다. 일반 성공에 '대성공!' 카드가 새어 나오지 않는다.
-   *
-   * @param keys 이번 결과의 라벨들(구체적인 것이 앞).
-   * @param allKeys 이 룰에서 나올 수 있는 라벨 전부 — 어느 라벨이 더 구체적인지 견주는 데 쓴다.
-   * @param sp 이번 발화의 화자 — 매어 둔 카드를 먼저 본다.
-   */
-  findCardForResult(roomId: string, keys: string[], allKeys: string[], sp?: CardSpeaker): VisualCard | undefined {
-    if (!keys.length) return undefined
-    // keys 는 구체적인 것이 앞이다('대성공' → '성공'). 그 차례를 점수로 삼아, 더 구체적인 라벨을 뜻하는
-    // 카드가 언제나 이긴다. 등록 순서로 이기게 두면 '성공' 카드를 먼저 만든 방에서 대성공에도 그것이 뜬다.
-    const rank = new Map(keys.map((k, i) => [k, i]))
-    const pick = (cards: VisualCard[]): VisualCard | undefined => {
-      let hit: VisualCard | undefined
-      let hitRank = Number.MAX_SAFE_INTEGER
-      let hitExact = false
-      for (const c of cards) {
-        const name = (c.name ?? '').trim()
-        if (!name) continue
-        // 이름이 라벨 그대로면 그 라벨을 뜻하는 것이 분명하다. 아니면 이름이 품은 라벨 중 가장 긴 것으로 본다.
-        const exact = rank.has(name)
-        let best = ''
-        if (!exact) for (const k of allKeys) if (k && name.includes(k) && k.length > best.length) best = k
-        const key = exact ? name : best
-        const r = key ? rank.get(key) : undefined
-        if (r === undefined) continue
-        // 같은 구체성이면 이름이 라벨과 똑같은 쪽을 먼저, 그다음은 등록순.
-        if (r < hitRank || (r === hitRank && exact && !hitExact)) {
-          hit = c
-          hitRank = r
-          hitExact = exact
+    // 로그인 아이디(username) 변경 — 관리자. 대상 접속 세션에 즉시 반영(소켓 data 갱신 + account:renamed 푸시).
+    // id(내부 UUID)는 불변이라 라우팅·소유관계는 그대로 — 토큰도 id 기반이라 대상은 로그아웃되지 않는다.
+    if (req.method === 'POST' && req.url === '/admin/username') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const username = typeof body.username === 'string' ? body.username : ''
+        const r = auth.setUsername(userId, username)
+        if (!r.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(r))
+          return
         }
-      }
-      return hit
+        for (const s of io.sockets.sockets.values()) {
+          if (s.data.account?.id === userId) {
+            s.data.account.username = r.account.username
+            s.emit('account:renamed', { username: r.account.username })
+          }
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, account: r.account }))
+      })
+      return
     }
-    for (const tier of this.cardTiers(roomId, sp)) {
-      const hit = pick(tier)
-      if (hit) return hit
-    }
-    return undefined
-  }
-  /**
-   * 채팅·스크립트 본문으로 카드 찾기 — 화면에 보이는 평문 기준으로 카드 이름이 '포함'되면 그 카드.
-   * 문장 속 키워드·스크립트 본문 키워드도 발동한다. 여러 카드가 매칭되면 이름이 긴(더 구체적인) 카드
-   * 우선, 동률은 등록순. 화자에게 매어 둔 카드가 걸리면 공용보다 먼저다.
-   */
-  findCardInText(roomId: string, text: string, sp?: CardSpeaker): VisualCard | undefined {
-    const t = stripChatMarkup(text).trim()
-    if (!t) return undefined
-    for (const tier of this.cardTiers(roomId, sp)) {
-      let hit: VisualCard | undefined
-      for (const c of tier) {
-        if (!c.name || !t.includes(c.name)) continue
-        if (!hit || c.name.length > hit.name.length) hit = c
-      }
-      if (hit) return hit
-    }
-    return undefined
-  }
-  /** id 로 카드 조회(수동 재생용). */
-  getVisualCard(roomId: string, cardId: string): VisualCard | undefined {
-    return this.rooms.get(roomId)?.visualCards?.find((c) => c.id === cardId)
-  }
 
-  /** 맵 배경 설정/해제(방어적 정규화). 저장본 반환, 맵 없으면 undefined. */
-  setBackground(roomId: string, mapId: string, bg: MapBackground | null): MapBackground | null | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return undefined
-    m.background =
-      bg && typeof bg === 'object'
+    // 유저 세션방 1개 강제 삭제 — 소유자 검증 없이 제거 + 참가자 강제 퇴장.
+    if (req.method === 'POST' && req.url === '/admin/room/delete') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const roomId = typeof body.roomId === 'string' ? body.roomId : ''
+        const del = store.adminDeleteRoom(roomId)
+        if (!del) {
+          res.writeHead(404, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '세션방을 찾을 수 없습니다.' }))
+          return
+        }
+        for (const pid of del.participants) {
+          io.to('user:' + pid).emit('room:closed', '관리자가 세션을 삭제했습니다.')
+          void io.in('user:' + pid).socketsLeave(roomId)
+          syncPresence(pid) // '세션중' 표시 해제
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // 유저 로비 꾸밈 초기화 — 공개 로비 스냅샷 제거(고아 자산은 이후 GC 회수).
+    if (req.method === 'POST' && req.url === '/admin/lobby/clear') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const ok = auth.adminClearLobby(userId)
+        res.writeHead(ok ? 200 : 404, JSON_H)
+        res.end(JSON.stringify(ok ? { ok: true } : { ok: false, error: '대상 계정을 찾을 수 없습니다.' }))
+      })
+      return
+    }
+
+    // 유저 캐릭터 전부 삭제 — 대상의 접속 세션엔 빈 라이브러리를 즉시 반영.
+    if (req.method === 'POST' && req.url === '/admin/chars/delete') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const n = characters.removeAll(userId)
+        // 빈 char:library 는 클라에서 '신규 계정 시드'로 해석돼 로컬 캐릭터를 되올린다 — 전용 char:wiped 로 로컬도 비운다.
+        io.to('acct:' + userId).emit('char:wiped')
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, removed: n }))
+      })
+      return
+    }
+
+    // 유저 블로그 전부 삭제.
+    if (req.method === 'POST' && req.url === '/admin/posts/delete') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        posts.removeAll(userId)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // 유저 세션 로그 전부 삭제.
+    if (req.method === 'POST' && req.url === '/admin/sessionlogs/delete') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        sessionlogs.removeAll(userId)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // 유저 계정+전체 데이터 완전 삭제 — /auth/delete 연쇄와 동일하나 관리자 권한으로(비밀번호 없이). admin 대상은 거부.
+    if (req.method === 'POST' && req.url === '/admin/user/purge') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const r = auth.deleteAccountById(userId)
+        if (!r.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(r))
+          return
+        }
+        const accountId = r.accountId
+        for (const fid of r.affectedFriends) io.to('user:' + fid).emit('friend:update') // (전)친구 목록 갱신
+        characters.removeAll(accountId)
+        posts.removeAll(accountId)
+        sessionlogs.removeAll(accountId)
+        dottown.removeAll(accountId)
+        economy.removeAll(accountId)
+        market.removeAll(accountId)
+        community.removeAll(accountId)
+        cmtyPosts.removeAll(accountId)
+        cmtyChars.removeAll(accountId, Date.now())
+        estate.removeAll(accountId)
+        broadcastLots()
+        notif.removeForUser(accountId) // 알림 피드 제거(고아 파일 방지)
+        dmRate.delete(accountId)
+        dmReadRate.delete(accountId)
+        econRate.delete(accountId)
+        socialRate.delete(accountId)
+        shownStatus.delete(accountId) // 프레즌스 표시 상태 정리
+        for (const peer of dm.removeForUser(accountId)) {
+          io.to('user:' + peer).emit('dm:cleared', { peer: accountId, by: peer })
+        }
+        // 그룹 DM 은 멤버 제거만(잔존 멤버 대화 보존) — 잔존 멤버에게 재조회 신호.
+        for (const g of dm.leaveAllGroups(accountId)) {
+          for (const m of g.remaining) io.to('user:' + m).emit('dm:group:update', { threadId: g.threadId })
+        }
+        for (const room of store.deleteOwnedBy(accountId)) {
+          for (const pid of room.participants) {
+            io.to('user:' + pid).emit('room:closed', '세션이 삭제되었습니다.')
+            void io.in('user:' + pid).socketsLeave(room.id)
+            syncPresence(pid) // 세션중 표시 해제(socket.data.roomId 잔존 대비 — inSession 이 store 재검증)
+          }
+        }
+        void io.in('acct:' + accountId).disconnectSockets(true) // 본인 소켓 강제 종료(프레즌스·레이트리밋 정리)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+
+    // 미참조(고아) 자산 즉시 정리 — 라이브 참조 집합을 모아 sweep(유예 보존). 확보 바이트 반환.
+    if (req.method === 'POST' && req.url === '/admin/gc') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        const live = new Set<string>()
+        store.collectAssetRefs(live)
+        characters.collectAssetRefs(live)
+        auth.collectAssetRefs(live)
+        posts.collectAssetRefs(live)
+        sessionlogs.collectAssetRefs(live)
+        dottown.collectAssetRefs(live)
+        economy.collectAssetRefs(live)
+        market.collectAssetRefs(live) // ⚠UGC 마켓 이미지 라이브셋(등록/보유) — sweep 회수 방지
+        community.collectAssetRefs(live)
+        cmtyPosts.collectAssetRefs(live)
+        cmtyChars.collectAssetRefs(live) // ⚠커뮤니티 이미지 라이브셋 — sweep 회수 방지
+        cmtyCatalog.collectAssetRefs(live)
+        cmtyGifts.collectAssetRefs(live)
+        cmtyGames.collectAssetRefs(live)
+        listAvatarRefs(live) // ⚠DM 목록이 옮겨 놓은 프사 — 계정 파일엔 원본이 남아 참조가 안 잡힌다(주기 정리와 짝)
+        const { removed, freed, deferred, deferredBytes, failed } = assets.sweep(live)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, removed, freed, deferred, deferredBytes, failed }))
+      })
+      return
+    }
+
+    // 서버 데이터 전체 내보내기(관리자) — data/ 의 모든 파일(계정·게시글·DM·세션방·캐릭터·자산·설정)을 base64 번들로 묶는다.
+    // 다른 서버로의 '완벽 이전'용. ⚠ accounts.json 의 비밀번호 해시·전체 DM 이 포함되므로 내려받은 파일을 안전하게 보관할 것.
+    if (req.method === 'POST' && req.url === '/admin/export') {
+      withBody(req, res, (body) => {
+        if (!requireAdmin(body, res)) return
+        try {
+          const files: Record<string, string> = {}
+          let total = 0
+          for (const f of listFilesRec(dataDir)) {
+            // 로그인 세션은 담지 않는다 — 토큰 자체가 열쇠라, 내보낸 파일을 가진 사람이 그대로 남의 계정으로
+            // 들어갈 수 있다. 옮겨 간 서버에서는 각자 한 번 로그인하면 그만이다.
+            // ⚠ 원자적 쓰기의 임시본(sessions.json.tmp)도 같은 토큰 목록이다. 이름 바꾸기가 실패하면
+            //   (윈도에서 백신·동기화 프로그램이 파일을 물고 있을 때) 그대로 남으므로 접두로 함께 막는다.
+            const rel = relative(dataDir, f)
+            if (rel === 'sessions.json' || rel.startsWith('sessions.json.')) continue
+            const buf = readFileSync(f)
+            total += buf.length
+            if (total > SERVER_EXPORT_MAX_BYTES) {
+              res.writeHead(413, JSON_H)
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: '서버 데이터가 너무 큽니다(약 100MB 초과). 앱 내 내보내기 대신 서버의 data 폴더를 직접 복사해 옮겨 주세요.'
+                })
+              )
+              return
+            }
+            files[rel.split(sep).join('/')] = buf.toString('base64') // 키는 정슬래시 상대경로
+          }
+          res.writeHead(200, JSON_H)
+          res.end(JSON.stringify({ type: 'tacoyaki-server', version: 1, exportedAt: Date.now(), files }))
+        } catch (e) {
+          console.error('[admin] 서버 내보내기 실패:', e)
+          res.writeHead(500, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '서버 데이터를 읽지 못했습니다.' }))
+        }
+      })
+      return
+    }
+
+    // 서버 데이터 가져오기(관리자) — 내보낸 번들을 data/ 에 복원. 토큰은 Authorization 헤더로(본문은 대용량 번들이라 분리).
+    // ⚠ 기존 data/ 를 덮어쓴다. 복원 후 서버를 재시작해야 인메모리 스토어가 새 데이터를 읽는다.
+    if (req.method === 'POST' && req.url === '/admin/import') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const account = auth.verifyToken(token)
+      if (!account || account.role !== 'admin') {
+        res.writeHead(account ? 403 : 401, JSON_H)
+        res.end(JSON.stringify({ ok: false, error: account ? '권한이 없습니다.' : '인증이 필요합니다.' }))
+        return
+      }
+      withRawBody(req, res, 200 * 1024 * 1024, (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '가져올 데이터가 비었거나 너무 큽니다.' }))
+          return
+        }
+        let bundle: Record<string, unknown> = {}
+        try {
+          const p = JSON.parse(buf.toString('utf8'))
+          if (p && typeof p === 'object' && !Array.isArray(p)) bundle = p as Record<string, unknown>
+        } catch {
+          bundle = {}
+        }
+        if (
+          bundle.type !== 'tacoyaki-server' ||
+          bundle.version !== 1 ||
+          !bundle.files ||
+          typeof bundle.files !== 'object'
+        ) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '타코야키 서버 백업 파일이 아닙니다.' }))
+          return
+        }
+        try {
+          let restored = 0
+          for (const [rel, b64] of Object.entries(bundle.files as Record<string, unknown>)) {
+            if (typeof b64 !== 'string' || !isSafeRelPath(rel)) continue // 비문자·경로 탈출 건너뜀
+            // 남의 로그인 세션은 복원하지 않는다(예전 백업에 섞여 있어도). 임시본도 같은 토큰 목록이다.
+            if (rel === 'sessions.json' || rel.startsWith('sessions.json.')) continue
+            const target = join(dataDir, rel)
+            mkdirSync(join(target, '..'), { recursive: true })
+            const tmp = target + '.tmp'
+            writeFileSync(tmp, Buffer.from(b64, 'base64'))
+            renameSync(tmp, target) // 원자적 교체
+            restored++
+          }
+          res.writeHead(200, JSON_H)
+          res.end(JSON.stringify({ ok: true, restored, restartRequired: true }))
+        } catch (e) {
+          console.error('[admin] 서버 가져오기 실패:', e)
+          res.writeHead(500, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '데이터 복원에 실패했습니다.' }))
+        }
+      })
+      return
+    }
+
+    // ===== 멤버 본인 데이터 이전 — 게시글·세션방을 본인이 내보내/가져오기(다른 서버로). 토큰 인증(손님 제외). =====
+    // 내보내기: 본문 { token }. 응답 = { type, version, blog, rooms, assets }. (로비 꾸밈·캐릭터는 클라 '전체 설정'에 별도 포함)
+    if (req.method === 'POST' && req.url === '/me/export') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        try {
+          const blog = posts.exportFor(account.id) // { posts, boards }
+          const slog = sessionlogs.exportFor(account.id) // { logs, boards }
+          const rooms = store.exportOwnedBy(account.id) // 내가 소유한 방 전체 장면·채팅
+          const dt = dottown.exportFor(account.id) // 마이룸·캐릭터 외형(메타)
+          // 코인 경제(지갑·소유·일일)는 멤버 본인 이전에서 제외 — 서버 권위 게임상태라 클라가 편집해 재가져오기로
+          //   주입하면 잔액/소유를 위조할 수 있다. 서버 간 전체 이전은 관리자 전체백업(파일 레벨)이 보존한다.
+          // 참조 자산 해시 수집 + 본문 JSON 크기 합산 — 상한은 '본문(글·로그·방) + 자산' 합으로 검사(인메모리 응답 문자열 보호).
+          const refs = new Set<string>()
+          const blogJson = JSON.stringify(blog)
+          scanAssetRefs(blogJson, refs)
+          let total = Buffer.byteLength(blogJson, 'utf8')
+          const slogJson = JSON.stringify(slog)
+          scanAssetRefs(slogJson, refs)
+          total += Buffer.byteLength(slogJson, 'utf8')
+          for (const rf of rooms) {
+            const rj = JSON.stringify(rf)
+            scanAssetRefs(rj, refs)
+            total += Buffer.byteLength(rj, 'utf8')
+          }
+          const dtJson = JSON.stringify(dt)
+          scanAssetRefs(dtJson, refs)
+          total += Buffer.byteLength(dtJson, 'utf8')
+          const tooBig = (): boolean => {
+            if (total > MEMBER_EXPORT_MAX_BYTES) {
+              res.writeHead(413, JSON_H)
+              res.end(JSON.stringify({ ok: false, error: '내 데이터가 너무 큽니다(약 80MB 초과). 세션방을 줄이거나 나눠서 옮겨 주세요.' }))
+              return true
+            }
+            return false
+          }
+          if (tooBig()) return // 본문만으로 이미 초과
+          const assetsOut: Record<string, { mime: string; data: string }> = {}
+          for (const hash of refs) {
+            const a = assets.resolve(hash)
+            if (!a) continue
+            let bytes: Buffer | undefined
+            if (a.path) {
+              try {
+                bytes = readFileSync(a.path)
+              } catch {
+                continue
+              }
+            } else {
+              bytes = a.bytes
+            }
+            if (!bytes) continue
+            total += bytes.length
+            if (tooBig()) return
+            assetsOut[hash] = { mime: a.mime, data: bytes.toString('base64') }
+          }
+          res.writeHead(200, JSON_H)
+          res.end(JSON.stringify({ type: 'tacoyaki-member-server', version: 1, blog, sessionlogs: slog, rooms, dottown: dt, assets: assetsOut }))
+        } catch (e) {
+          console.error('[me] 내보내기 실패:', e)
+          res.writeHead(500, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '내 데이터를 읽지 못했습니다.' }))
+        }
+      })
+      return
+    }
+
+    // 가져오기: 토큰=Authorization Bearer(본문은 대용량 번들). 게시글·세션방을 이 계정 소유로 복원(손님 제외).
+    if (req.method === 'POST' && req.url === '/me/import') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const account = auth.verifyToken(token)
+      if (!account) {
+        res.writeHead(401, JSON_H)
+        res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+        return
+      }
+      if (account.role === 'guest') {
+        res.writeHead(403, JSON_H)
+        res.end(JSON.stringify({ ok: false, error: '손님 계정은 게시글·세션방을 가질 수 없습니다(관리자 승인 후 이용).' }))
+        return
+      }
+      withRawBody(req, res, 160 * 1024 * 1024, async (buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '가져올 데이터가 비었거나 너무 큽니다.' }))
+          return
+        }
+        let bundle: Record<string, unknown> = {}
+        try {
+          const p = JSON.parse(buf.toString('utf8'))
+          if (p && typeof p === 'object' && !Array.isArray(p)) bundle = p as Record<string, unknown>
+        } catch {
+          bundle = {}
+        }
+        if (bundle.type !== 'tacoyaki-member-server' || bundle.version !== 1) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '타코야키 내 데이터 백업이 아닙니다.' }))
+          return
+        }
+        try {
+          // 1) 자산 먼저 복원(콘텐츠 주소 — 같은 해시로 재저장, mime 보존) → 글·방의 asset 참조가 새 서버에서 살아남.
+          const assetsIn =
+            bundle.assets && typeof bundle.assets === 'object'
+              ? (bundle.assets as Record<string, { mime?: string; data?: string }>)
+              : {}
+          // 개별 자산 크기(assets.maxBytes)·개수 상한 — 인증 멤버라도 임의 대용량/대량 자산 주입을 막는다.
+          await Promise.all(
+            Object.values(assetsIn)
+              .slice(0, 5000)
+              .map((a) => {
+                if (!a || typeof a.data !== 'string') return Promise.resolve('')
+                const bytes = Buffer.from(a.data, 'base64')
+                if (bytes.length === 0 || bytes.length > assets.maxBytes) return Promise.resolve('') // 빈/과대 자산 건너뜀
+                return assets
+                  .put(bytes, typeof a.mime === 'string' ? a.mime : 'application/octet-stream')
+                  .catch(() => '')
+              })
+          )
+          // 2) 게시글·게시판 복원(새 계정 재귀속).
+          const blog = bundle.blog && typeof bundle.blog === 'object' ? (bundle.blog as Record<string, unknown>) : {}
+          const postCount = posts.importFor(account.id, blog.posts, blog.boards)
+          // 3) 세션 로그·게시판 복원(구버전 번들엔 없을 수 있음 — 없으면 0건).
+          const slog = bundle.sessionlogs && typeof bundle.sessionlogs === 'object' ? (bundle.sessionlogs as Record<string, unknown>) : {}
+          const slogCount = sessionlogs.importFor(account.id, slog.logs, slog.boards)
+          // 4) 세션방 복원(새 id·코드·소유자=나).
+          const roomCount = store.importOwnedBy(account.id, bundle.rooms, account.nickname || account.username)
+          // 5) 도트타운 마이룸·캐릭터 복원(구버전 번들엔 없을 수 있음 — 없으면 무시).
+          //    저장 라우트와 동일한 소유권 게이트 — 번들을 위조해도 미보유 프리미엄/마켓 아이템이 되살아나지 않게 거른다.
+          const ownsFurn = (id: string): boolean =>
+            id.startsWith('m_') ? market.owns(account.id, id) : economy.canPlace(account.id, id)
+          // 방/캐릭터 1건에 소유권 게이트 적용(방=미보유 가구 제거·미보유 벽지/바닥 비움, 캐릭터=미보유 마켓 의상 탈락).
+          const gateRoom = (roomIn: object): Record<string, unknown> => {
+            const room = { ...(roomIn as Record<string, unknown>) }
+            room.placed = (Array.isArray(room.placed) ? room.placed : []).filter((p) => {
+              const fid = p && typeof p === 'object' ? (p as Record<string, unknown>).furnitureId : null
+              return typeof fid === 'string' && ownsFurn(fid)
+            })
+            for (const k of ['wallpaperId', 'flooringId']) {
+              const id = room[k]
+              if (typeof id === 'string' && id && (id.startsWith('m_') || !economy.canPlace(account.id, id))) room[k] = ''
+            }
+            return room
+          }
+          const gateChar = (charIn: object): Record<string, unknown> => {
+            const char = { ...(charIn as Record<string, unknown>) }
+            const inLayers = char.layers && typeof char.layers === 'object' ? (char.layers as Record<string, unknown>) : {}
+            const layers: Record<string, unknown> = {}
+            for (const [slot, val] of Object.entries(inLayers)) {
+              const id = val && typeof val === 'object' ? (val as Record<string, unknown>).id : null
+              if (typeof id === 'string' && id.startsWith('m_') && !market.owns(account.id, id)) continue // 미보유 마켓 의상 탈락
+              layers[slot] = val
+            }
+            char.layers = layers
+            return char
+          }
+          const gateDottown = (data: unknown): unknown => {
+            if (!data || typeof data !== 'object') return data
+            const dt = { ...(data as Record<string, unknown>) }
+            if (dt.room && typeof dt.room === 'object') dt.room = gateRoom(dt.room)
+            if (dt.char && typeof dt.char === 'object') dt.char = gateChar(dt.char)
+            // 저장 슬롯도 방/캐릭터와 동일 게이트 — 위조 번들의 미보유 아이템이 프리셋 슬롯에 저장되지 않게(게이팅 일관성).
+            if (Array.isArray(dt.roomPresets)) {
+              dt.roomPresets = dt.roomPresets.map((s) => {
+                if (!s || typeof s !== 'object') return s
+                const slot = { ...(s as Record<string, unknown>) }
+                if (slot.layout && typeof slot.layout === 'object') slot.layout = gateRoom(slot.layout)
+                return slot
+              })
+            }
+            if (Array.isArray(dt.charPresets)) {
+              dt.charPresets = dt.charPresets.map((s) => {
+                if (!s || typeof s !== 'object') return s
+                const slot = { ...(s as Record<string, unknown>) }
+                if (slot.char && typeof slot.char === 'object') slot.char = gateChar(slot.char)
+                return slot
+              })
+            }
+            return dt
+          }
+          dottown.importFor(account.id, gateDottown(bundle.dottown))
+          // 코인 경제는 가져오기에서 의도적으로 제외(위조 방지 — 위 /me/export 주석 참고).
+          res.writeHead(200, JSON_H)
+          res.end(JSON.stringify({ ok: true, posts: postCount, sessionlogs: slogCount, rooms: roomCount }))
+        } catch (e) {
+          console.error('[me] 가져오기 실패:', e)
+          res.writeHead(500, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '데이터 복원에 실패했습니다.' }))
+        }
+      })
+      return
+    }
+
+    // ===== 도트타운(확장팩) 마이룸·캐릭터 영속 =====
+    // 마이룸 저장 — 토큰 인증(손님 제외, 본인 방만). 본문 { token, layout }. rev 충돌 시 409 + 현재 서버본.
+    // 성공 시 dottown:updated 를 전체 브로드캐스트 → 그 방을 '방문 중'인 클라가 재조회(멤버십 상태 없이 신호만).
+    if (req.method === 'POST' && req.url === '/dottown/room/save') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 마이룸을 꾸밀 수 없습니다(관리자 승인 후 이용).' }))
+          return
+        }
+        if (econLimited(account.id, res)) return // 전체 파일 동기 재기록 라우트 — 연타 폭주 차단
+        // 소유권 게이트(안티치트) — 배치 가구는 마켓(m_) 소유 또는 프리미엄 economy 소유, 벽지/바닥은 프리미엄 economy 소유만.
+        const layout = body.layout && typeof body.layout === 'object' ? (body.layout as Record<string, unknown>) : {}
+        const placed = Array.isArray(layout.placed) ? layout.placed : []
+        const furnIds: string[] = []
+        for (const p of placed) {
+          const fid = p && typeof p === 'object' ? (p as Record<string, unknown>).furnitureId : null
+          if (typeof fid === 'string') furnIds.push(fid)
+        }
+        // 가구: 마켓 id 는 보유, 그 외는 economy(무료/프리미엄) 소유.
+        const badFurn = furnIds.some((id) => (id.startsWith('m_') ? !market.owns(account.id, id) : !economy.canPlace(account.id, id)))
+        // 벽지/바닥: 마켓엔 타일 종류가 없으므로 m_ id 는 무효(거부), 그 외는 economy 소유.
+        const tileIds = [layout.wallpaperId, layout.flooringId].filter((x): x is string => typeof x === 'string' && x.length > 0)
+        const badTile = tileIds.some((id) => id.startsWith('m_') || !economy.canPlace(account.id, id))
+        if (badFurn || badTile) {
+          res.writeHead(403, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '보유하지 않았거나 올바르지 않은 아이템이 포함돼 있어요.' }))
+          return
+        }
+        const result = dottown.saveRoom(account.id, body.layout)
+        if (result.ok) io.emit('dottown:updated', { ownerId: account.id })
+        res.writeHead(result.ok ? 200 : 409, JSON_H)
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 마이룸 조회(공개 읽기전용) — GET /dottown/room?id=<userId>. 방+캐릭터+공개 프로필 동봉(방문 1회 조회).
+    if (req.method === 'GET' && req.url && (req.url === '/dottown/room' || req.url.startsWith('/dottown/room?'))) {
+      const id = new URLSearchParams(req.url.split('?')[1] ?? '').get('id') ?? ''
+      if (id && lobbyLocked(res, bearerViewerId(req), id)) return
+      const owner = id ? auth.getAccountById(id) : null
+      // working=알바 중 → 방문자 화면에서 호스트 캐릭터 숨김(마이룸 비움).
+      res.writeHead(200, JSON_H)
+      res.end(JSON.stringify({ ok: true, layout: dottown.getRoom(id), char: dottown.getChar(id), owner, working: id ? economy.isWorking(id) : false }))
+      return
+    }
+    // 캐릭터 외형 저장 — 토큰 인증(손님 제외). 본문 { token, config }(레이어 맵).
+    if (req.method === 'POST' && req.url === '/dottown/char/save') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (account.role === 'guest') {
+          res.writeHead(403, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '손님 계정은 캐릭터를 저장할 수 없습니다.' }))
+          return
+        }
+        if (econLimited(account.id, res)) return // 전체 파일 동기 재기록 라우트 — 연타 폭주 차단
+        // 마켓 의상(m_…)은 보유(구매/창작)해야 착용 저장 가능 — 미보유 위조 차단.
+        const cfg = body.config && typeof body.config === 'object' ? (body.config as Record<string, unknown>) : {}
+        const layers = cfg.layers && typeof cfg.layers === 'object' ? (cfg.layers as Record<string, unknown>) : {}
+        for (const v of Object.values(layers)) {
+          const id = v && typeof v === 'object' ? (v as Record<string, unknown>).id : null
+          if (typeof id === 'string' && id.startsWith('m_') && !market.owns(account.id, id)) {
+            res.writeHead(403, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: '보유하지 않은 마켓 의상이 포함돼 있어요.' }))
+            return
+          }
+        }
+        const r = dottown.saveChar(account.id, body.config)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 캐릭터 외형 조회(공개 읽기전용) — GET /dottown/char?id=<userId>. 도트타운 표시 닉네임도 동봉.
+    if (req.method === 'GET' && req.url && (req.url === '/dottown/char' || req.url.startsWith('/dottown/char?'))) {
+      const id = new URLSearchParams(req.url.split('?')[1] ?? '').get('id') ?? ''
+      res.writeHead(200, JSON_H)
+      res.end(JSON.stringify({ ok: true, char: dottown.getChar(id), nick: dottown.getNick(id) }))
+      return
+    }
+    // 도트타운 표시 닉네임 저장(본인·멤버) — POST /dottown/nick { token, nick }. 빈 값=해제(계정 닉네임 폴백).
+    if (req.method === 'POST' && req.url === '/dottown/nick') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return // 전체 파일 동기 재기록 — 연타 폭주 차단
+        const r = dottown.setNick(account.id, body.nick)
+        broadcastLots() // 집 위 라벨(ownerNick)이 현재 닉으로 다시 해석되도록 광장에 최신 lots 재송출
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+
+    // ===== 도트타운 저장 슬롯(마이룸/캐릭터 프리셋 각 6개) — 전부 멤버 전용(본인 것). =====
+    // 슬롯 저장은 '현재 방/외형'의 스냅샷일 뿐 — 소유권 게이트는 '불러오기(=room/save·char/save)'에서 재검증되므로 여기선 생략.
+    if (req.method === 'POST' && req.url === '/dottown/room/presets') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, presets: dottown.listRoomPresets(account.id) }))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/dottown/room/preset/save') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return // 전체 파일 동기 재기록 — 연타 폭주 차단
+        const r = dottown.saveRoomPreset(account.id, body.slot as number, body.layout)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/dottown/room/preset/delete') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = dottown.deleteRoomPreset(account.id, body.slot as number)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/dottown/char/presets') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, presets: dottown.listCharPresets(account.id) }))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/dottown/char/preset/save') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = dottown.saveCharPreset(account.id, body.slot as number, body.config)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    if (req.method === 'POST' && req.url === '/dottown/char/preset/delete') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = dottown.deleteCharPreset(account.id, body.slot as number)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+
+    // ===== 도트타운 소셜 — 좋아요·방문·방명록·인기 랭킹 =====
+    // 내 방 소셜 요약(소유주) — 토큰 인증(누구나 본인 것). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/social') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, ...dottown.ownSocial(account.id) }))
+      })
+      return
+    }
+    // 방 방문 기록(고유 계정) + 방문자 관점 요약 — 토큰 인증. 본문 { token, target }.
+    if (req.method === 'POST' && req.url === '/dottown/room/visit') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (socialLimited(account.id, res)) return
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (!target || !auth.getAccountById(target)) {
+          res.writeHead(404, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '대상을 찾을 수 없습니다.' }))
+          return
+        }
+        if (lobbyLocked(res, account.id, target)) return
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, ...dottown.recordVisit(target, account.id) }))
+      })
+      return
+    }
+    // 방 좋아요 토글(본인 방 불가) — 토큰 인증. 본문 { token, target }. 최초 좋아요면 소유주에 코인 보상.
+    if (req.method === 'POST' && req.url === '/dottown/room/like') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (socialLimited(account.id, res)) return
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (!target || !auth.getAccountById(target)) {
+          res.writeHead(404, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '대상을 찾을 수 없습니다.' }))
+          return
+        }
+        if (lobbyLocked(res, account.id, target)) return
+        const r = dottown.toggleLike(target, account.id)
+        // 코인 보상은 '멤버가 누른 최초 좋아요'에만 지급 — 손님은 무승인·무제한 가입이 가능하므로,
+        //   손님 계정을 대량 생성해 자기 방에 좋아요를 눌러 코인을 무한 발행하는 파밍을 차단한다(좋아요 자체는 손님도 허용).
+        if (r.ok && r.reward && account.role !== 'guest') {
+          const rr = economy.applyDelta(target, LIKE_REWARD, 'like', account.id)
+          if (rr.ok) io.to('user:' + target).emit('dottown:coin', { balance: rr.balance })
+        }
+        if (r.ok) io.emit('dottown:updated', { ownerId: target }) // 방문자·소유주 카운트 갱신
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 방명록 남기기 — 토큰 인증(작성자 이름/프로필은 서버가 계정에서 채움). 본문 { token, target, message }.
+    if (req.method === 'POST' && req.url === '/dottown/guestbook') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (socialLimited(account.id, res)) return
+        const target = typeof body.target === 'string' ? body.target : ''
+        if (!target || !auth.getAccountById(target)) {
+          res.writeHead(404, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '대상을 찾을 수 없습니다.' }))
+          return
+        }
+        if (lobbyLocked(res, account.id, target)) return
+        const message = typeof body.message === 'string' ? body.message : ''
+        const r = dottown.addGuest(target, { id: account.id, name: account.nickname || account.username, avatar: account.avatar }, message)
+        if (r.ok) {
+          io.emit('dottown:updated', { ownerId: target })
+          notify(target, { kind: 'dtguestbook', actor: actorOf(account), text: message }) // 종 알림(마이룸 주인)
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 방명록 삭제(방 주인 또는 작성자) — 토큰 인증. 본문 { token, target, entryId }.
+    if (req.method === 'POST' && req.url === '/dottown/guestbook/delete') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (socialLimited(account.id, res)) return
+        const target = typeof body.target === 'string' ? body.target : ''
+        const entryId = typeof body.entryId === 'string' ? body.entryId : ''
+        const r = dottown.removeGuest(target, account.id, entryId)
+        // 실제로 지웠을 때만 알린다 — 아무것도 안 지운 요청까지 방송하면, 그 요청 하나가 접속 중인
+        // 모든 화면에 '주인이 방을 고쳤다'는 신호를 보내 다시 받아 오게 만든다.
+        if (r.removed) io.emit('dottown:updated', { ownerId: target })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 인기 마이룸 랭킹(공개 읽기전용) — GET /dottown/top. 소유주 공개 프로필 동봉.
+    if (req.method === 'GET' && req.url && (req.url === '/dottown/top' || req.url.startsWith('/dottown/top?'))) {
+      const rooms = dottown.topRooms(20).map((r) => ({ ...r, owner: auth.getAccountById(r.ownerId) }))
+      res.writeHead(200, JSON_H)
+      res.end(JSON.stringify({ ok: true, rooms }))
+      return
+    }
+
+    // ===== 도트타운 경제 — 코인·아르바이트·상점·일일 보상(서버 권위) =====
+    // 진행 알바 shift → 소켓/응답 페이로드(계정 id·status 제외).
+    const jobPayload = (
+      sh: { shopId: string; startAt: number; endAt: number; minutes: number; hourlyWage: number } | null
+    ): { shopId: string; startAt: number; endAt: number; minutes: number; hourlyWage: number; remainingMs: number } | null =>
+      sh
         ? {
-            image: capImage(bg.image),
-            w: clampCoord(bg.w),
-            h: clampCoord(bg.h),
-            fit: bg.fit === 'contain' || bg.fit === 'cover' ? bg.fit : undefined
+            shopId: sh.shopId,
+            startAt: sh.startAt,
+            endAt: sh.endAt,
+            minutes: sh.minutes,
+            hourlyWage: sh.hourlyWage,
+            // 서버 시계 기준 남은 시간 — 클라가 벽시계 오차와 무관하게 카운트다운을 앵커하게(수신 시점 상대값).
+            remainingMs: Math.max(0, sh.endAt - Date.now())
           }
         : null
-    room.lastActivityAt = Date.now()
-    return m.background
-  }
 
-  /**
-   * 비주얼 노벨 무대 배경 설정/해제(GM 전용 — 권한 검증은 호출 측 relay).
-   * image 빈값이면 해제. {ok,image} 반환(ok=false 면 맵 없음 → 미동작).
-   */
-  setVnBackground(roomId: string, mapId: string, image: string | undefined): { ok: boolean; image?: string } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.vnBackground = capImage(image)
-    room.lastActivityAt = Date.now()
-    return { ok: true, image: m.vnBackground }
-  }
-
-  /** VN 배경 흐림 강도 설정(GM 검증은 relay) — 0=없음. 저장값 반환({ok,blur}), 맵 없으면 ok:false. */
-  setVnBgBlur(roomId: string, mapId: string, blur: number): { ok: boolean; blur?: number } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.vnBackgroundBlur = coerceVnBlur(blur)
-    room.lastActivityAt = Date.now()
-    return { ok: true, blur: m.vnBackgroundBlur }
-  }
-
-  /** 맵 배경 단색 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). 빈/무효(비-hex)면 해제. {ok,color} 반환. */
-  setMapBgColor(roomId: string, mapId: string, color: string | undefined): { ok: boolean; color?: string } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.bgColor = coerceDimColor(color)
-    room.lastActivityAt = Date.now()
-    return { ok: true, color: m.bgColor }
-  }
-
-  /** 맵 바탕(최후면 이미지+블러) 설정/해제(GM 전용 — 권한 검증은 호출 측 relay). null/무효면 해제. {ok,backdrop} 반환. */
-  setMapBackdrop(
-    roomId: string,
-    mapId: string,
-    backdrop: MapBackdrop | null
-  ): { ok: boolean; backdrop?: MapBackdrop } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.backdrop = coerceBackdrop(backdrop)
-    room.lastActivityAt = Date.now()
-    return { ok: true, backdrop: m.backdrop }
-  }
-
-  /** 맵 레이어 표시/숨김 전체 교체(GM 전용 — 권한 검증은 relay). 무대 앞 밴드·무대 뒤를 맵 단위로 동기. */
-  setMapLayerVis(roomId: string, mapId: string, hidden: unknown): { ok: boolean; hidden?: TokenLayer[] } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.hiddenLayers = coerceHiddenLayers(hidden)
-    room.lastActivityAt = Date.now()
-    return { ok: true, hidden: m.hiddenLayers }
-  }
-
-  /** 맵세트 메타(크로스페이드) 전체 교체(GM 전용 — 권한 검증은 relay). 미지정 필드는 해제. */
-  setMapMeta(
-    roomId: string,
-    mapId: string,
-    meta: { crossfade?: boolean }
-  ): { ok: boolean; crossfade?: boolean } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.crossfade = meta?.crossfade === true ? true : undefined
-    room.lastActivityAt = Date.now()
-    return { ok: true, crossfade: m.crossfade }
-  }
-
-  /**
-   * 맵세트 번들 BGM 저장/해제(GM 전용 — 권한 검증은 relay).
-   * 'save'=현재 방 BGM(자산 참조)을 이 맵에 스냅샷(재업로드 없음 · 방이 이미 참조를 들고 있음),
-   * 'clear'=번들 해제. {ok,bgm} 반환(bgm=null 이면 미저장). 맵 없으면 ok:false.
-   */
-  setMapBgm(roomId: string, mapId: string, op: 'save' | 'clear'): { ok: boolean; bgm?: BgmState[] | null } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.bgm = op === 'clear' ? undefined : room.bgm.map((t) => ({ ...t }))
-    room.lastActivityAt = Date.now()
-    return { ok: true, bgm: m.bgm ?? null }
-  }
-
-  /**
-   * VN 무대 레이어 스택 전체 교체(GM 전용 — 권한 검증은 호출 측 relay).
-   * 방어적 정규화(이미지 캡·개수 상한·z/opacity 클램프). {ok,layers} 반환(ok=false면 맵 없음).
-   */
-  setVnLayers(roomId: string, mapId: string, layers: unknown): { ok: boolean; layers?: VnLayer[] } {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return { ok: false }
-    m.vnLayers = coerceVnLayers(layers)
-    room.lastActivityAt = Date.now()
-    return { ok: true, layers: m.vnLayers ?? [] }
-  }
-
-  /** 맵 그리드 설정(방어적 정규화: size 8~512 클램프). 저장본 반환, 맵 없으면 undefined. */
-  setGrid(roomId: string, mapId: string, grid: GridConfig): GridConfig | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return undefined
-    const size =
-      typeof grid?.size === 'number' ? Math.round(Math.max(8, Math.min(512, grid.size))) : m.grid.size
-    m.grid = { size, visible: grid?.visible !== false }
-    room.lastActivityAt = Date.now()
-    return m.grid
-  }
-
-  /** 토큰 컬렉션 해석 — GLOBAL_MAP_ID 면 통합 레이어(방 레벨·모든 맵 유지), 아니면 해당 맵의 tokens. */
-  private tokenColl(room: Room, mapId: string): Map<string, Token> | undefined {
-    if (mapId === GLOBAL_MAP_ID) return (room.globalTokens ??= new Map<string, Token>())
-    return room.maps.get(mapId)?.tokens
-  }
-
-  /** 토큰 생성/갱신. id 없으면 신규(randomUUID), 있으면 기존 갱신. 저장본 반환, 맵/컬렉션 없으면 undefined. */
-  upsertToken(roomId: string, mapId: string, req: TokenUpsertReq): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const tokens = room ? this.tokenColl(room, mapId) : undefined
-    if (!room || !tokens) return undefined
-    const existing = typeof req.id === 'string' ? tokens.get(req.id) : undefined
-    const layer = typeof req.layer === 'string' ? coerceLayer(req.layer) : (existing?.layer ?? 'token')
-    // 같은 레이어 갱신이면 z 보존, 신규·레이어 이동이면 그 레이어 맨 앞으로(top+1).
-    const z =
-      existing && (existing.layer ?? 'token') === layer
-        ? (existing.z ?? 0)
-        : topZ(tokens.values(), layer) + 1
-    // 좌표·크기는 유한·범위 클램프, 이미지/식별자는 캡. charPlayerId 는 GM 전용 경로라
-    // 길이만 캡 — 이동 권한은 charPlayerId===playerId 일치로만 부여되어 잘못된 id 는 누구에게도 권한 없음.
-    const token: Token = {
-      id: existing?.id ?? (typeof req.id === 'string' && req.id ? req.id : randomUUID()),
-      x: clampCoord(req.x, existing?.x ?? 0),
-      y: clampCoord(req.y, existing?.y ?? 0),
-      size:
-        typeof req.size === 'number' && Number.isFinite(req.size) && req.size > 0
-          ? Math.min(req.size, MAX_TOKEN_CELLS)
-          : (existing?.size ?? 1),
-      // 비정방 스트레치 비율(가로·세로 칸) — 0=해제, 양수=적용, 미지정=기존 보존(크기는 size=긴 변).
-      w: req.w === 0 ? undefined : (coerceSpanCells(req.w) ?? existing?.w),
-      h: req.h === 0 ? undefined : (coerceSpanCells(req.h) ?? existing?.h),
-      rotation:
-        typeof req.rotation === 'number' && Number.isFinite(req.rotation) ? req.rotation : existing?.rotation,
-      charPlayerId: capId(req.charPlayerId) ?? existing?.charPlayerId,
-      charId: capId(req.charId) ?? existing?.charId,
-      label: typeof req.label === 'string' ? req.label.slice(0, 200) : existing?.label,
-      color: typeof req.color === 'string' ? req.color.slice(0, 32) : existing?.color,
-      image: capImage(req.image) ?? existing?.image,
-      layer,
-      z,
-      flipX: req.flipX === true ? true : req.flipX === false ? undefined : existing?.flipX,
-      // 이름/UI 숨김 — 명시값이면 적용(true=숨김, false=해제), 미지정이면 기존 보존.
-      hideName: req.hideName === true ? true : req.hideName === false ? undefined : existing?.hideName,
-      hideUI: req.hideUI === true ? true : req.hideUI === false ? undefined : existing?.hideUI,
-      // 이동/회전 권한 명단 — 배열이면 정규화 적용(빈 배열=해제), 미지정이면 기존 보존.
-      allowedPlayers: Array.isArray(req.allowedPlayers)
-        ? coercePlayerIds(req.allowedPlayers)
-        : existing?.allowedPlayers,
-      // 이미지 카드 — 배열이면 적용(최대 20장), 미지정이면 기존 보존. currentIndex 는 정수면 적용, 아니면 보존.
-      images: Array.isArray(req.images) ? capImageList(req.images, 20) : existing?.images,
-      currentIndex:
-        typeof req.currentIndex === 'number' && Number.isInteger(req.currentIndex) && req.currentIndex >= 0
-          ? req.currentIndex
-          : existing?.currentIndex,
-      // 패널 속성 — 불리언은 명시값 적용(true=on, false=해제), 미지정 시 보존. 문자열은 캡·빈값이면 해제.
-      lockPos: req.lockPos === true ? true : req.lockPos === false ? undefined : existing?.lockPos,
-      lockSize: req.lockSize === true ? true : req.lockSize === false ? undefined : existing?.lockSize,
-      terrain: req.terrain === true ? true : req.terrain === false ? undefined : existing?.terrain,
-      memo: typeof req.memo === 'string' ? req.memo.slice(0, 500) || undefined : existing?.memo,
-      clickAction:
-        typeof req.clickAction === 'string'
-          ? req.clickAction.slice(0, 500) || undefined
-          : existing?.clickAction,
-      // 클릭 연출 카드 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존. 실존 카드 검사는
-      // 재생 시점(card:trigger)에 한다 — 카드를 먼저 지웠다 다시 만들어도 묶임이 살아 있게.
-      clickCardId:
-        typeof req.clickCardId === 'string'
-          ? req.clickCardId.slice(0, 64) || undefined
-          : existing?.clickCardId,
-      // 뒷면 이미지 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존.
-      backImage:
-        typeof req.backImage === 'string'
-          ? req.backImage
-            ? capImage(req.backImage)
-            : undefined
-          : existing?.backImage,
-      // 커스텀 상태바 — 배열이면 정규화 적용(빈 배열=해제), 미지정이면 기존 보존.
-      bars: Array.isArray(req.bars) ? coerceBars(req.bars) : existing?.bars,
-      statsPrivate:
-        req.statsPrivate === true ? true : req.statsPrivate === false ? undefined : existing?.statsPrivate,
-      // 가져오기 출처 태그 — 편집(upsert)으로는 바뀌지 않는다(가져오기·로드에서만 부여).
-      importId: existing?.importId,
-      // 참가자 창작 오브젝트 소유자 — 편집으로는 바뀌지 않는다(참가자 배치에서만 서버가 스탬프).
-      ownerPlayerId: existing?.ownerPlayerId,
-      // 표시 맵 제한 — null 이면 해제(모든 맵에 표시), 배열이면 그 목록, 미지정이면 기존 보존.
-      // 가져오기가 박아 둔 제한을 사람이 풀 수 있어야 한다(못 풀면 새 맵세트가 빈 판으로 보인다).
-      mapIds:
-        req.mapIds === null
-          ? undefined
-          : Array.isArray(req.mapIds)
-            ? req.mapIds.filter((x): x is string => typeof x === 'string' && !!x).slice(0, 200)
-            : existing?.mapIds,
-      // 라이브 스탠딩 — 명시값이면 적용(true=on, false=해제), 미지정이면 기존 보존.
-      liveStanding:
-        req.liveStanding === true ? true : req.liveStanding === false ? undefined : existing?.liveStanding,
-      // 버튼 토큰 교체 이미지 — 문자열이면 적용(빈 문자열=해제), 미지정이면 기존 보존(뒷면 이미지와 동일 규칙).
-      hoverImage:
-        typeof req.hoverImage === 'string'
-          ? req.hoverImage
-            ? capImage(req.hoverImage)
-            : undefined
-          : existing?.hoverImage,
-      pressImage:
-        typeof req.pressImage === 'string'
-          ? req.pressImage
-            ? capImage(req.pressImage)
-            : undefined
-          : existing?.pressImage,
-      // 상태별 효과음 — 객체가 오면 정규화 적용(빈 객체=해제), 미지정이면 기존 보존.
-      sounds: req.sounds !== undefined ? coerceSounds(req.sounds) : existing?.sounds,
-      // 공개범위 — visibility 명시값 우선, 없으면 레거시 hidden(true=private·false=해제), 그래도 없으면 기존 보존.
-      ...visFields(
-        coerceVisibility(req.visibility) ??
-          (req.hidden === true
-            ? 'private'
-            : req.hidden === false
-              ? 'all'
-              : existing?.visibility ?? (existing?.hidden ? 'private' : undefined))
-      )
-    }
-    tokens.set(token.id, token)
-    room.lastActivityAt = Date.now()
-    return token
-  }
-
-  /**
-   * 참가자 오브젝트 배치/갱신 — 요청 필드를 화이트리스트로만 옮겨 upsertToken 에 태운다(클램프·이미지 캡 공유).
-   * 신규면 ownerPlayerId=playerId 를 스탬프하고, id 가 기존 토큰이면 그 토큰의 소유자가 본인일 때만 갱신한다
-   * (GM·다른 참가자의 토큰을 덮어쓰는 길 차단). 통합 레이어(GLOBAL_MAP_ID)는 방을 넘어 남으므로 배치 거부.
-   * 방 설정(plObjects) 검사는 호출 측(relay).
-   */
-  placePlToken(roomId: string, mapId: string, playerId: string, req: TokenPlacePlReq): Token | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || mapId === GLOBAL_MAP_ID) return undefined
-    const tokens = this.tokenColl(room, mapId)
-    if (!tokens) return undefined
-    // id 는 길이 캡을 넘으면 통째로 무시(신규 취급) — 거대한 문자열이 키로 남는 것 방지.
-    const reqId = typeof req.id === 'string' && req.id && req.id.length <= 200 ? req.id : undefined
-    const existing = reqId ? tokens.get(reqId) : undefined
-    if (existing && existing.ownerPlayerId !== playerId) return undefined // 남의 토큰 갱신 금지
-    if (!existing) {
-      // 1인당 참가자 오브젝트 상한(방 전체·모든 맵 합산) — 초과 배치는 무시.
-      let mine = 0
-      for (const m of room.maps.values())
-        for (const t of m.tokens.values()) if (t.ownerPlayerId === playerId) mine++
-      if (mine >= MAX_PL_OBJECTS_PER_PLAYER) return undefined
-    }
-    // 안전 부분집합만 복사 — 공개범위·상태바·클릭 동작·권한 명단 등 GM 전용 필드는 여기서 원천 차단.
-    const safe: TokenUpsertReq = {
-      mapId,
-      id: reqId,
-      x: req.x,
-      y: req.y,
-      size: req.size,
-      w: req.w,
-      h: req.h,
-      rotation: req.rotation,
-      label: req.label,
-      color: req.color,
-      image: req.image,
-      images: req.images,
-      flipX: req.flipX,
-      layer: req.layer // 정규화(coerceLayer)는 upsertToken 이 담당
-    }
-    const token = this.upsertToken(roomId, mapId, safe)
-    if (!token) return undefined
-    // 신규 배치에만 소유자 각인 — upsertToken 이 저장한 그 객체에 직접 남긴다(요청으로는 못 바꾼다).
-    if (!existing) token.ownerPlayerId = playerId
-    return token
-  }
-
-  /** 토큰 이동(위치만). 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay). */
-  moveToken(roomId: string, mapId: string, id: string, x: number, y: number): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const token = room ? this.tokenColl(room, mapId)?.get(id) : undefined
-    if (!room || !token) return undefined
-    token.x = clampCoord(x, token.x)
-    token.y = clampCoord(y, token.y)
-    room.lastActivityAt = Date.now()
-    return token
-  }
-
-  /** 토큰 회전(각도만, 라디안). 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay · 이동과 동일). */
-  rotateToken(roomId: string, mapId: string, id: string, rotation: number): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const token = room ? this.tokenColl(room, mapId)?.get(id) : undefined
-    if (!room || !token) return undefined
-    token.rotation = Number.isFinite(rotation) ? rotation : (token.rotation ?? 0)
-    room.lastActivityAt = Date.now()
-    return token
-  }
-
-  /** 토큰 크기(칸, 긴 변) 변경. 0.25~캡(MAX_TOKEN_CELLS) 칸으로 클램프 — 추가(upsertToken)와 같은 상한을 쓴다
-   *  (다르면 '넣을 땐 되는데 조절하면 줄어드는' 토큰이 생긴다). 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay · 이동과 동일). */
-  resizeToken(roomId: string, mapId: string, id: string, size: number): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const token = room ? this.tokenColl(room, mapId)?.get(id) : undefined
-    if (!room || !token) return undefined
-    if (Number.isFinite(size)) token.size = Math.max(0.25, Math.min(MAX_TOKEN_CELLS, size))
-    room.lastActivityAt = Date.now()
-    return token
-  }
-
-  /** 이미지 카드의 표시 이미지 인덱스 변경(images 범위로 클램프). 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay · 이동과 동일). */
-  setTokenImageIndex(roomId: string, mapId: string, id: string, index: number): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const token = room ? this.tokenColl(room, mapId)?.get(id) : undefined
-    if (!room || !token) return undefined
-    const max = (token.images?.length ?? 1) - 1
-    token.currentIndex = Math.max(0, Math.min(Math.floor(index), Math.max(0, max)))
-    room.lastActivityAt = Date.now()
-    return token
-  }
-
-  /** 토큰 삭제. 삭제된 토큰 반환, 없으면 undefined. */
-  removeToken(roomId: string, mapId: string, id: string): Token | undefined {
-    const room = this.rooms.get(roomId)
-    const coll = room ? this.tokenColl(room, mapId) : undefined
-    const prev = coll?.get(id)
-    if (!room || !coll || !prev) return undefined
-    coll.delete(id)
-    room.lastActivityAt = Date.now()
-    return prev
-  }
-
-  getToken(roomId: string, mapId: string, id: string): Token | undefined {
-    const room = this.rooms.get(roomId)
-    return room ? this.tokenColl(room, mapId)?.get(id) : undefined
-  }
-
-  /**
-   * 지금 보고 있는 화면의 겹침 순서 — 통합 레이어와 그 맵의 레이어를 한 줄로 세워 뒤→앞으로 돌려준다.
-   *
-   * 화면은 두 컬렉션을 한 배열에 담아 밴드별로 z 순으로 그린다. 순서를 매기는 쪽도 같은 줄을 보아야
-   * 목록에서 끌어 놓은 자리와 실제로 그려지는 자리가 어긋나지 않는다.
-   * z 가 같은 것끼리는 통합 레이어를 뒤에 두어 그리는 쪽의 순서(통합 먼저 넣고 맵 토큰을 얹는다)를 따른다.
-   */
-  private sceneStack(room: Room, sceneMapId: string): { token: Token; mapId: string }[] {
-    const rows: { token: Token; mapId: string; seq: number }[] = []
-    let seq = 0
-    for (const t of room.globalTokens?.values() ?? [])
-      // 표시 맵이 지정된 통합 레이어는 그 맵에서만 그려진다 — 안 보이는 것이 줄에 끼면 순번을 먹는다.
-      if (!t.mapIds || t.mapIds.includes(sceneMapId)) rows.push({ token: t, mapId: GLOBAL_MAP_ID, seq: seq++ })
-    if (sceneMapId !== GLOBAL_MAP_ID)
-      for (const t of room.maps.get(sceneMapId)?.tokens.values() ?? [])
-        rows.push({ token: t, mapId: sceneMapId, seq: seq++ })
-    rows.sort((a, b) => {
-      const d = LAYER_ORDER[a.token.layer ?? 'token'] - LAYER_ORDER[b.token.layer ?? 'token']
-      if (d !== 0) return d
-      const dz = (a.token.z ?? 0) - (b.token.z ?? 0)
-      return dz !== 0 ? dz : a.seq - b.seq
-    })
-    return rows.map(({ token, mapId }) => ({ token, mapId }))
-  }
-
-  /**
-   * 한 줄로 세운 순서를 z 로 다시 굳힌다 — 밴드마다, 고정하지 않은 것들에만 새 값을 매긴다.
-   *
-   * 밖에서 가져온 맵세트는 여러 오브젝트가 같은 z 를 쓰는 일이 흔한데, 그러면 '한 칸 앞으로'가 그 무리를
-   * 통째로 건너뛰어 끌어 놓은 자리에 내려앉지 않는다. 자리를 옮길 때마다 번호를 다시 매겨 같은 값을 없앤다.
-   *
-   * ⚠ pinned 는 '건드리면 안 되는 컬렉션'이다. 통합 레이어는 모든 맵이 함께 쓰므로, 이 맵에서 순서를
-   * 바꿨다고 통합 레이어의 z 를 다시 매기면 **다른 맵의 겹침이 소리 없이 뒤바뀐다**. 그래서 맵 토큰을
-   * 옮길 때는 통합 레이어를 고정하고, 고정된 이웃 사이의 빈 자리에 소수로 끼워 넣는다(z 는 실수여도 된다).
-   * 값이 실제로 달라진 것만 돌려주므로, 이미 정돈된 줄에서는 움직인 언저리만 다시 방송된다.
-   */
-  private renumber(
-    stack: { token: Token; mapId: string }[],
-    pinned?: string
-  ): { mapId: string; token: Token }[] {
-    const changed: { mapId: string; token: Token }[] = []
-    const byBand = new Map<TokenLayer, { token: Token; mapId: string }[]>()
-    for (const row of stack) {
-      const band = row.token.layer ?? 'token'
-      const list = byBand.get(band)
-      if (list) list.push(row)
-      else byBand.set(band, [row])
-    }
-    for (const rows of byBand.values()) {
-      // 고정된 이웃을 경계로 잘라, 그 사이의 자유로운 것들에만 값을 나눠 준다.
-      let i = 0
-      while (i < rows.length) {
-        if (pinned !== undefined && rows[i].mapId === pinned) {
-          i++
-          continue
+    // 경제 상태 일괄 조회(위젯 오픈 시) — 토큰 인증(누구나 본인 것). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/econ') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
         }
-        let j = i
-        while (j < rows.length && !(pinned !== undefined && rows[j].mapId === pinned)) j++
-        const lo = i > 0 ? (rows[i - 1].token.z ?? 0) : undefined
-        const hi = j < rows.length ? (rows[j].token.z ?? 0) : undefined
-        const n = j - i
-        // 양쪽 경계가 없으면 1,2,3…, 한쪽만 있으면 그 옆으로 1씩, 둘 다 있으면 사이를 n+1 등분한다.
-        const from = lo ?? (hi !== undefined ? hi - (n + 1) : 0)
-        const to = hi ?? from + (n + 1)
-        const step = to > from ? (to - from) / (n + 1) : 1
-        for (let k = 0; k < n; k++) {
-          const row = rows[i + k]
-          const z = from + step * (k + 1)
-          if (row.token.z !== z) {
-            row.token.z = z
-            changed.push({ mapId: row.mapId, token: row.token })
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, ...economy.snapshot(account.id) }))
+      })
+      return
+    }
+    // 일일 보상 수령(member+). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/daily/claim') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = economy.claimDaily(account.id)
+        if (r.ok) io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 알바 시작(member+). 본문 { token, shopId, minutes }.
+    if (req.method === 'POST' && req.url === '/dottown/job/start') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const shopId = typeof body.shopId === 'string' ? body.shopId : ''
+        const minutes = typeof body.minutes === 'number' ? body.minutes : 0
+        const r = economy.startJob(account.id, shopId, minutes)
+        if (r.ok && r.shift) {
+          // 근무 시작 → 이 계정을 마이룸 실시간 방문에서 강제 이탈시킨다(입장 게이트만으론 '이미 방에 있다가 근무 시작'을
+          //   못 막는다). 액터 제거(타인 화면서 즉시 사라짐) + 그 계정 소켓의 socket.io 방/상태 정리.
+          roomVisit.kick(account.id)
+          for (const s of io.sockets.sockets.values()) {
+            if (s.data.account?.id === account.id && s.data.visitRoomId) {
+              void s.leave('roomvisit:' + s.data.visitRoomId)
+              s.data.visitRoomId = undefined
+            }
           }
+          io.to('user:' + account.id).emit('dottown:job', { shift: jobPayload(r.shift) })
+          // 그 가게 점원으로 "영업 중" 전파 — 광장에 없던 유저면 저장된 외형(nick·look)으로 점원 액터 주입(탭 무관 카운터 유지).
+          plaza.setWorking(account.id, true, shopId, { nick: displayNick(account.id), look: dottown.getChar(account.id) })
         }
-        i = j
-      }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r.ok ? { ok: true, shift: jobPayload(r.shift ?? null) } : r))
+      })
+      return
     }
-    return changed
-  }
+    // 퇴근·정산(member+). 본문 { token }. now>=endAt 서버 재검증 후 지급.
+    if (req.method === 'POST' && req.url === '/dottown/job/finish') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = economy.finishJob(account.id)
+        if (r.ok) {
+          io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance })
+          io.to('user:' + account.id).emit('dottown:job', { shift: null })
+          plaza.setWorking(account.id, false) // 퇴근 → "영업 중" 해제
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 근무 취소(보상 없음, member+). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/job/cancel') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = economy.cancelJob(account.id)
+        if (r.had) {
+          io.to('user:' + account.id).emit('dottown:job', { shift: null }) // 진행 중이던 경우에만 브로드캐스트
+          plaza.setWorking(account.id, false) // 근무 취소 → "영업 중" 해제
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
+    // 상점 구매(member+) — 코인 소각 + 소유권. 본문 { token, itemId }.
+    if (req.method === 'POST' && req.url === '/dottown/shop/buy') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const itemId = typeof body.itemId === 'string' ? body.itemId : ''
+        const r = economy.buy(account.id, itemId)
+        if (r.ok) io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
 
-  /**
-   * 토큰 z순서/레이어 변경(GM 전용 — 권한 검증은 호출 측 relay). layer 지정 시 그 레이어 맨 앞으로 이동,
-   * op='moveTo' 면 targetId 옆자리로 한 번에, forward/backward 는 한 칸씩,
-   * front/back 은 무대 같은 쪽의 끝까지 간다(그리는 방식이 같은 밴드 안에서 — 원형 두상은 token 밴드에 머문다).
-   * 변경된 토큰을 그것이 속한 컬렉션(mapId)과 함께 반환 → relay 가 각각 token:state 송출.
-   */
-  reorderToken(
-    roomId: string,
-    mapId: string,
-    id: string,
-    req: { op?: TokenZOp; layer?: TokenLayer; sceneMapId?: string; targetId?: string; side?: 'front' | 'back' }
-  ): { mapId: string; token: Token }[] {
-    const room = this.rooms.get(roomId)
-    const coll = room ? this.tokenColl(room, mapId) : undefined
-    const t = coll?.get(id)
-    if (!room || !coll || !t) return []
-    // 겹침은 통합 레이어와 이 맵의 레이어가 한 줄로 섞여 그려진다 — 순서도 그 한 줄 위에서 매긴다.
-    // 부르는 쪽이 보고 있는 맵을 알려 주지 않으면(구버전 클라) 예전처럼 제 컬렉션 안에서만 다룬다.
-    const sceneMapId = req.sceneMapId ?? (mapId === GLOBAL_MAP_ID ? undefined : mapId)
-    const stack = sceneMapId
-      ? this.sceneStack(room, sceneMapId)
-      : [...coll.values()]
-          .sort(
-            (a, b) =>
-              LAYER_ORDER[a.layer ?? 'token'] - LAYER_ORDER[b.layer ?? 'token'] || (a.z ?? 0) - (b.z ?? 0)
-          )
-          .map((token) => ({ token, mapId }))
-    const changed: { mapId: string; token: Token }[] = []
-    const curLayer = t.layer ?? 'token'
-    /** 이 토큰이 속한 컬렉션 — 한 줄에 섞여 있어도 방송은 제 컬렉션으로 나가야 한다. */
-    const collOf = (x: Token): string => stack.find((r) => r.token === x)?.mapId ?? mapId
-    /** 무대 앞(bg·token·standing)과 무대 뒤(behind)는 서로 순서를 섞지 않는다 — 무대 이미지가 사이에 있다. */
-    const sameSide = (a: TokenLayer, b: TokenLayer): boolean => (a === 'behind') === (b === 'behind')
-    /**
-     * 겹침을 옮길 때 넘나들 수 있는 밴드인지. 밴드는 순서만 정하는 것이 아니라 **그리는 방식**도 정한다 —
-     * token 밴드만 원형 두상(이름·수치 바)으로 그리고 나머지는 직사각 이미지다. 그래서 순서를 바꾸려다
-     * 이 경계를 넘으면 두상이 통째로 다른 그림이 된다. 밴드를 바꾸는 것은 '무대 앞뒤 보내기'처럼
-     * 사용자가 그렇게 하겠다고 고른 길(req.layer)에만 맡긴다.
-     */
-    const sameKind = (a: TokenLayer, b: TokenLayer): boolean => (a === 'token') === (b === 'token')
-    /** 옮긴 토큰이 통합 레이어면 맵 토큰을, 맵 토큰이면 통합 레이어를 고정한다(다른 맵을 흔들지 않게). */
-    const pinned = mapId === GLOBAL_MAP_ID ? sceneMapId : GLOBAL_MAP_ID
-    /**
-     * 끌어 놓은 자리에 맞는 밴드. 원형 두상은 제 밴드에 머물고, 이미지는 무대 뒤(behind)와
-     * 캐릭터보다 뒤(bg)·앞(standing) 중 놓인 자리에 맞는 것을 고른다. 캐릭터 토큰이 하나도 없으면
-     * 앞뒤를 가를 기준이 없으므로 놓은 대상의 밴드를 그대로 따른다.
-     */
-    const bandFor = (line: Token[], idx: number, target: Token): TokenLayer => {
-      if (curLayer === 'token') return 'token'
-      const tl = target.layer ?? 'token'
-      if (tl === 'behind') return 'behind'
-      const lastChar = line.reduce((acc, x, i) => (x !== t && (x.layer ?? 'token') === 'token' ? i : acc), -1)
-      if (lastChar < 0) return sameKind(tl, curLayer) ? tl : curLayer
-      return idx > lastChar ? 'standing' : 'bg'
+    // 낚시 던지기(member+) — 쿨다운 확인 후 입질 시각을 서버가 랜덤 결정. 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/fish/cast') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = economy.castFish(account.id)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
     }
-    if (req.layer && coerceLayer(req.layer) !== curLayer) {
-      const layer = coerceLayer(req.layer)
-      // topZ 를 레이어 변경 전에 계산(아직 옛 레이어 → t 자신이 새 레이어 max 에 포함되지 않음).
-      const z = topZ(coll.values(), layer) + 1 // 새 레이어 맨 앞으로
-      t.layer = layer
-      t.z = z
-      changed.push({ mapId, token: t })
-    } else if (req.op === 'moveTo') {
-      // 목록에서 끌어 놓은 자리로 한 번에. 예전에는 '한 칸씩'을 그 수만큼 연달아 보내야 했는데,
-      // 같은 z 가 섞여 있으면 한 칸이 여러 칸을 뛰어 엉뚱한 데 내려앉았다.
-      const target = req.targetId ? stack.find((r) => r.token.id === req.targetId)?.token : undefined
-      if (target && target !== t) {
-        const line = stack.map((r) => r.token)
-        const from = line.indexOf(t)
-        let at = line.indexOf(target)
-        if (from >= 0 && at >= 0) {
-          // 줄은 뒤→앞 순이다. 'front'=대상보다 앞(뒤에서 셀 때 한 칸 뒤에), 'back'=대상보다 뒤.
-          if (req.side === 'front') at += 1
-          line.splice(from, 1)
-          if (from < at) at -= 1
-          line.splice(at, 0, t)
-          // 놓인 자리에 맞는 밴드를 고른다. 다만 그리는 방식이 다른 밴드(token ↔ 이미지)로는 넘어가지
-          // 않는다 — 겹침만 바꾸려다 원형 두상이 직사각 이미지가 되어서는 안 된다.
-          const band = bandFor(line, line.indexOf(t), target)
-          if (band !== curLayer) {
-            t.layer = band
-            changed.push({ mapId: collOf(t), token: t })
+    // 낚시 당기기(member+) — 입질 시간창(서버 권위) 판정. 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/fish/pull') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = economy.pullFish(account.id)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 물고기 판매(member+) — itemId 생략 시 전량. 본문 { token, itemId? }.
+    if (req.method === 'POST' && req.url === '/dottown/fish/sell') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const itemId = typeof body.itemId === 'string' ? body.itemId : undefined
+        const r = economy.sellFish(account.id, itemId)
+        if (r.ok) io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 구버전 낚시 경로 — 현재는 미지원(조용한 실패 대신 업데이트 안내).
+    if (req.method === 'POST' && req.url === '/dottown/fish') {
+      res.writeHead(400, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '앱이 구버전이에요. 업데이트하면 새 낚시 미니게임을 즐길 수 있어요.' }))
+      return
+    }
+    // 요리(member+) — 레시피 재료 소비 + 코인 보상. 본문 { token, recipeId }.
+    if (req.method === 'POST' && req.url === '/dottown/cook') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const recipeId = typeof body.recipeId === 'string' ? body.recipeId : ''
+        const r = economy.cook(account.id, recipeId)
+        if (r.ok) io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+
+    // ===== 도트타운 광장 부동산 — 빈터 입주(전세/월세)·외형·월세납부·퇴거 =====
+    // 스냅샷(member+) — 20칸 + 내 집. 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/estate') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, lots: estate.lots(), myLot: estate.myLot(account.id) }))
+      })
+      return
+    }
+    // 입주(member+) — 빈 칸에 전세/월세로 건물 세움(계정당 1채). 본문 { token, index, tenancy, style }.
+    if (req.method === 'POST' && req.url === '/dottown/estate/lease') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const index = typeof body.index === 'number' ? body.index : -1
+        const tenancy = body.tenancy === 'wolse' ? 'wolse' : 'jeonse'
+        const style = typeof body.style === 'number' ? body.style : 0
+        const r = estate.lease(account.id, displayNick(account.id) || account.username, index, tenancy, style)
+        if (r.ok) {
+          io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance ?? economy.balanceOf(account.id) })
+          broadcastLots()
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 건물 외형 변경(member+·무료). 본문 { token, style }.
+    if (req.method === 'POST' && req.url === '/dottown/estate/style') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const style = typeof body.style === 'number' ? body.style : 0
+        const r = estate.setStyle(account.id, style)
+        if (r.ok) broadcastLots()
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 월세 납부(member+·하루치). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/estate/pay') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = estate.payRent(account.id)
+        if (r.ok) io.to('user:' + account.id).emit('dottown:coin', { balance: r.balance ?? economy.balanceOf(account.id) })
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 방 빼기(member+·환불 없음). 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/estate/moveout') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const r = estate.moveOut(account.id)
+        if (r.had) broadcastLots()
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+
+    // ===== 도트타운 UGC 마켓 — 유저 제작 가구/의상 등록·구매(창작 경제) =====
+    // 공개 목록(숨김 제외) — GET /dottown/market.
+    if (req.method === 'GET' && req.url && (req.url === '/dottown/market' || req.url.startsWith('/dottown/market?'))) {
+      res.writeHead(200, JSON_H)
+      res.end(JSON.stringify({ ok: true, items: market.list() }))
+      return
+    }
+    // 내 상태(보유 + 내 등록) — 토큰 인증. 본문 { token }.
+    if (req.method === 'POST' && req.url === '/dottown/market/state') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, owned: market.ownedItems(account.id), listings: market.mine(account.id) }))
+      })
+      return
+    }
+    // 등록(member+) — 본문 { token, kind, name, price, files:{key:'asset:<hash>'}, layer?, flippable? }.
+    //   업로드된 자산을 서버가 직접 읽어 PNG·치수·용량을 재검증(클라 신뢰 안 함). 창작자에게 소유권 자동 부여.
+    if (req.method === 'POST' && req.url === '/dottown/market/submit') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const kind = body.kind === 'clothes' ? 'clothes' : 'furniture'
+        const inFiles = body.files && typeof body.files === 'object' ? (body.files as Record<string, unknown>) : {}
+        const cleanFiles: Record<string, string> = {}
+        for (const [key, ref] of Object.entries(inFiles).slice(0, 16)) {
+          if (typeof ref !== 'string') continue
+          const hash = ref.startsWith('asset:') ? ref.slice(6) : ref
+          if (!assets.isHash(hash)) continue
+          const a = assets.read(hash)
+          if (!a || a.bytes.length > MARKET_FILE_MAX) {
+            res.writeHead(400, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: '이미지가 없거나 너무 커요(파일당 256KB 이하).' }))
+            return
           }
-          for (const row of this.renumber(line.map((token) => ({ token, mapId: collOf(token) })), pinned))
-            if (!changed.some((c) => c.token === row.token)) changed.push(row)
-        }
-      }
-    } else if (req.op) {
-      const sibs = stack.map((r) => r.token).filter((x) => (x.layer ?? 'token') === curLayer)
-      /** 한 칸 넘어갈 수 있는 다음 밴드 — 그리는 방식이 같은 것만 고른다(건너뛰면 두상이 이미지가 된다). */
-      const nextBand = (dir: 1 | -1): TokenLayer | undefined => {
-        for (let i = REORDER_BANDS.indexOf(curLayer) + dir; i >= 0 && i < REORDER_BANDS.length; i += dir) {
-          const b = REORDER_BANDS[i]
-          if (sameKind(b, curLayer)) return b
-        }
-        return undefined
-      }
-      const myz = t.z ?? 0
-      if (req.op === 'front' || req.op === 'back') {
-        // 맨 앞·맨 뒤는 무대 같은 쪽의 끝까지 간다. 예전에는 제 밴드 안에서만 움직여, 눌러도 위에 있는
-        // 밴드에 가려 '아무 일도 안 일어난' 것처럼 보였다. 다만 그리는 방식은 지킨다 — 원형 두상은
-        // token 밴드에 머물고, 이미지는 캐릭터보다 앞(standing)·뒤(bg)·무대 뒤(behind) 안에서만 옮긴다.
-        // 끝으로 보내는 것뿐이라 번호를 다시 매기지 않는다(한 번 누를 때마다 줄 전체를 다시 방송하게 된다).
-        const side = stack.map((r) => r.token).filter((x) => x !== t && sameSide(x.layer ?? 'token', curLayer))
-        const band: TokenLayer =
-          curLayer === 'token'
-            ? 'token'
-            : curLayer === 'behind'
-              ? 'behind'
-              : req.op === 'front' && side.some((x) => !sameKind(x.layer ?? 'token', curLayer) || (x.layer ?? 'token') === 'standing')
-                ? 'standing'
-                : 'bg'
-        const peers = side.filter((x) => (x.layer ?? 'token') === band).map((x) => x.z ?? 0)
-        const edge = peers.length ? (req.op === 'front' ? Math.max(...peers) : Math.min(...peers)) : 0
-        const z = req.op === 'front' ? edge + 1 : edge - 1
-        if (curLayer !== band || t.z !== z) {
-          t.layer = band
-          t.z = z
-          changed.push({ mapId: collOf(t), token: t })
-        }
-      } else if (req.op === 'forward') {
-        // 바로 위(다음으로 큰 z) 형제와 z 교환.
-        const next = sibs.filter((s) => (s.z ?? 0) > myz).sort((a, b) => (a.z ?? 0) - (b.z ?? 0))[0]
-        if (next) {
-          const nz = next.z ?? 0
-          next.z = myz
-          t.z = nz
-          changed.push({ mapId: collOf(t), token: t }, { mapId: collOf(next), token: next })
-        } else {
-          // 밴드 맨 앞 → 그리는 방식이 같은 다음 밴드로 승격(그 밴드 맨 뒤에 붙임). 클라 planReorder 미러.
-          const up = nextBand(-1)
-          if (up) {
-            const ups = stack.map((r) => r.token).filter((x) => (x.layer ?? 'token') === up)
-            t.layer = up
-            t.z = (ups.length ? Math.min(...ups.map((s) => s.z ?? 0)) : 0) - 1
-            changed.push({ mapId: collOf(t), token: t })
+          const dim = pngDimensions(a.bytes)
+          if (!dim) {
+            res.writeHead(400, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: 'PNG 이미지만 올릴 수 있어요.' }))
+            return
           }
-        }
-      } else if (req.op === 'backward') {
-        // 바로 아래(다음으로 작은 z) 형제와 z 교환.
-        const prev = sibs.filter((s) => (s.z ?? 0) < myz).sort((a, b) => (b.z ?? 0) - (a.z ?? 0))[0]
-        if (prev) {
-          const pz = prev.z ?? 0
-          prev.z = myz
-          t.z = pz
-          changed.push({ mapId: collOf(t), token: t }, { mapId: collOf(prev), token: prev })
-        } else {
-          // 밴드 맨 뒤 → 그리는 방식이 같은 다음 밴드로 강등(그 밴드 맨 앞에 붙임). bg→behind 면 무대 뒤로.
-          const down = nextBand(1)
-          if (down) {
-            const downs = stack.map((r) => r.token).filter((x) => (x.layer ?? 'token') === down)
-            t.layer = down
-            t.z = (downs.length ? Math.max(...downs.map((s) => s.z ?? 0)) : 0) + 1
-            changed.push({ mapId: collOf(t), token: t })
+          if (kind === 'clothes' && (dim.w !== CHAR_CANVAS.w || dim.h !== CHAR_CANVAS.h)) {
+            res.writeHead(400, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: `의상은 ${CHAR_CANVAS.w}×${CHAR_CANVAS.h} 크기여야 해요.` }))
+            return
           }
-        }
-      }
-    }
-    if (changed.length) room.lastActivityAt = Date.now()
-    return changed
-  }
-
-  // ===== 자유 드로잉 =====
-  /**
-   * 드로잉 획 추가(전원). points 는 유한 숫자만·짝수 길이로 정규화하고 4000개(2000점)로 상한,
-   * width 는 1~40 클램프. playerId/color 는 호출 측(relay)이 참가자 정보로 스탬프. 저장본 반환.
-   */
-  addStroke(
-    roomId: string,
-    mapId: string,
-    req: { id?: unknown; points: unknown; width?: unknown },
-    author: { playerId: string; color: string }
-  ): Stroke | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return undefined
-    const raw = Array.isArray(req.points) ? req.points : []
-    const pts: number[] = []
-    for (const v of raw) {
-      if (typeof v === 'number' && Number.isFinite(v)) pts.push(v)
-      if (pts.length >= 4000) break
-    }
-    if (pts.length % 2 !== 0) pts.pop()
-    if (pts.length < 2) return undefined // 점이 너무 적으면 획 아님
-    const width =
-      typeof req.width === 'number' && Number.isFinite(req.width) ? Math.max(1, Math.min(40, req.width)) : 4
-    const stroke: Stroke = {
-      id: typeof req.id === 'string' && req.id ? req.id : randomUUID(),
-      playerId: author.playerId,
-      color: author.color,
-      width,
-      points: pts
-    }
-    m.drawings.set(stroke.id, stroke)
-    room.lastActivityAt = Date.now()
-    return stroke
-  }
-
-  getStroke(roomId: string, mapId: string, strokeId: string): Stroke | undefined {
-    return this.getMap(roomId, mapId)?.drawings.get(strokeId)
-  }
-
-  /** 드로잉 획 삭제. 삭제된 획 반환, 없으면 undefined. 권한 검증은 호출 측(relay). */
-  eraseStroke(roomId: string, mapId: string, strokeId: string): Stroke | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    const prev = m?.drawings.get(strokeId)
-    if (!room || !m || !prev) return undefined
-    m.drawings.delete(strokeId)
-    room.lastActivityAt = Date.now()
-    return prev
-  }
-
-  /** 맵의 모든 드로잉 삭제(GM 전용 — 호출 측 검증). 맵 있으면 true. */
-  clearDrawings(roomId: string, mapId: string): boolean {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return false
-    m.drawings.clear()
-    room.lastActivityAt = Date.now()
-    return true
-  }
-
-  // ===== 맵 텍스트 라벨 =====
-  /**
-   * 맵 텍스트 생성/편집. id 없으면 신규(작성자=author.playerId), 있으면 기존 편집(텍스트·색·크기·굵기·위치만).
-   * 권한 검증(편집은 작성자/GM)은 호출 측(relay). 텍스트가 비면 null(생성 안 함). 맵당 최대 500개.
-   */
-  upsertText(
-    roomId: string,
-    mapId: string,
-    req: MapTextUpsertReq,
-    author: { playerId: string }
-  ): MapText | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return undefined
-    const existing = typeof req.id === 'string' ? m.texts.get(req.id) : undefined
-    const text = typeof req.text === 'string' ? req.text.slice(0, 200) : ''
-    if (!text) return undefined
-    if (!existing && m.texts.size >= 500) return undefined // 폭주 방지 상한
-    const label: MapText = {
-      id: existing?.id ?? (typeof req.id === 'string' && req.id ? req.id : randomUUID()),
-      playerId: existing?.playerId ?? author.playerId, // 작성자는 생성 시 고정(편집해도 불변)
-      x: clampCoord(req.x, existing?.x ?? 0),
-      y: clampCoord(req.y, existing?.y ?? 0),
-      text,
-      color:
-        typeof req.color === 'string' && req.color ? req.color.slice(0, 32) : (existing?.color ?? '#ffffff'),
-      size:
-        typeof req.size === 'number' && Number.isFinite(req.size)
-          ? Math.max(8, Math.min(200, req.size))
-          : (existing?.size ?? 28),
-      bold: req.bold === true ? true : req.bold === false ? undefined : existing?.bold
-    }
-    m.texts.set(label.id, label)
-    room.lastActivityAt = Date.now()
-    return label
-  }
-
-  /** 맵 텍스트 이동(위치만). 권한 검증(작성자/GM)은 호출 측(relay). */
-  moveText(roomId: string, mapId: string, id: string, x: number, y: number): MapText | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    const t = m?.texts.get(id)
-    if (!room || !m || !t) return undefined
-    t.x = clampCoord(x, t.x)
-    t.y = clampCoord(y, t.y)
-    room.lastActivityAt = Date.now()
-    return t
-  }
-
-  /** 맵 텍스트 삭제. 삭제된 텍스트 반환. 권한 검증(작성자/GM)은 호출 측(relay). */
-  removeText(roomId: string, mapId: string, id: string): MapText | undefined {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    const prev = m?.texts.get(id)
-    if (!room || !m || !prev) return undefined
-    m.texts.delete(id)
-    room.lastActivityAt = Date.now()
-    return prev
-  }
-
-  getText(roomId: string, mapId: string, id: string): MapText | undefined {
-    return this.getMap(roomId, mapId)?.texts.get(id)
-  }
-
-  /** 맵의 모든 텍스트 삭제(GM 전용 — 호출 측 검증). 맵 있으면 true. */
-  clearTexts(roomId: string, mapId: string): boolean {
-    const room = this.rooms.get(roomId)
-    const m = room?.maps.get(mapId)
-    if (!room || !m) return false
-    m.texts.clear()
-    room.lastActivityAt = Date.now()
-    return true
-  }
-
-  // ===== 세션 목록·관리 (서버 영속) =====
-  /** 계정의 세션 목록(소유 또는 참여) — 최근 활동 순. */
-  listForAccount(accountId: string): RoomSummary[] {
-    const out: RoomSummary[] = []
-    for (const room of this.rooms.values()) {
-      if (isGm(room, accountId) || room.members.has(accountId))
-        out.push(this.summaryFor(room, accountId))
-    }
-    return out.sort((a, b) => b.updatedAt - a.updatedAt)
-  }
-
-  /** 세션 메타(이름·카드) 수정 — 소유자만. cardImage=null 이면 제거. 갱신 요약 반환. */
-  setMeta(
-    roomId: string,
-    accountId: string,
-    patch: { title?: string; cardImage?: string | null }
-  ): RoomSummary | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || room.ownerId !== accountId) return undefined
-    if (typeof patch.title === 'string' && patch.title.trim()) room.title = patch.title.trim().slice(0, 80)
-    if (patch.cardImage === null) room.cardImage = undefined
-    else if (typeof patch.cardImage === 'string' && patch.cardImage)
-      room.cardImage = capImage(patch.cardImage) ?? room.cardImage
-    room.lastActivityAt = Date.now()
-    void this.flush(room)
-    return this.summaryFor(room, accountId)
-  }
-
-  /**
-   * 공동 GM 지정·해제 — 소유자만. 대상은 이 방에 한 번이라도 들어온 계정이어야 한다.
-   *
-   * 지금 방에 있는 사람이면 참가자 레코드의 role 까지 그 자리에서 맞춘다. 방 안의 권한 검사는
-   * 전부 role 을 보므로, 여기서 안 맞추면 다음에 다시 들어올 때까지 권한이 따라오지 않는다.
-   * 소유자는 대상이 될 수 없다 — 이미 GM 이고, 지정을 해제한다는 말이 성립하지 않는다.
-   */
-  setGm(roomId: string, ownerId: string, targetId: string, on: boolean): { error: string } | { ok: true } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { error: '세션을 찾을 수 없습니다.' }
-    if (room.ownerId !== ownerId) return { error: '방을 만든 사람만 GM 을 지정할 수 있습니다.' }
-    if (!targetId || targetId === room.ownerId) return { error: '방을 만든 사람은 언제나 GM 입니다.' }
-    if (on && !room.members.has(targetId) && !room.participants.has(targetId))
-      return { error: '이 세션에 들어온 적 없는 사람입니다.' }
-    if (on) room.gmIds.add(targetId)
-    else room.gmIds.delete(targetId)
-    const p = room.participants.get(targetId)
-    if (p) p.role = on ? 'GM' : 'PL'
-    room.lastActivityAt = Date.now()
-    void this.flush(room)
-    return { ok: true }
-  }
-
-  /**
-   * 방 양도 — 소유자만. 대상이 새 소유자가 되고, 넘긴 사람은 공동 GM 으로 남는다.
-   *
-   * 넘긴 사람을 PL 로 떨어뜨리지 않는 이유는 단순하다. 양도는 보통 '오늘은 네가 진행해'라는 뜻이지
-   * '나는 이제 손을 뗀다'가 아니고, 잘못 눌렀을 때 되돌릴 사람이 방 안에 아무도 남지 않으면 곤란하다.
-   * 되돌리려면 새 소유자가 다시 양도하면 된다.
-   */
-  transferOwner(roomId: string, ownerId: string, targetId: string): { error: string } | { ok: true } {
-    const room = this.rooms.get(roomId)
-    if (!room) return { error: '세션을 찾을 수 없습니다.' }
-    if (room.ownerId !== ownerId) return { error: '방을 만든 사람만 양도할 수 있습니다.' }
-    if (!targetId || targetId === ownerId) return { error: '자기 자신에게는 넘길 수 없습니다.' }
-    if (!room.members.has(targetId) && !room.participants.has(targetId))
-      return { error: '이 세션에 들어온 적 없는 사람입니다.' }
-    room.ownerId = targetId
-    room.members.add(targetId)
-    room.members.add(ownerId) // 넘긴 사람이 '내 세션 목록'에서 사라지지 않게
-    room.gmIds.delete(targetId) // 새 소유자는 소유자라서 GM 이다 — 공동 GM 명단에 겹쳐 두지 않는다
-    room.gmIds.add(ownerId)
-    const np = room.participants.get(targetId)
-    if (np) np.role = 'GM'
-    room.lastActivityAt = Date.now()
-    void this.flush(room)
-    return { ok: true }
-  }
-
-  /** 세션 삭제 — 소유자만. 메모리·파일 제거. 알릴 대상(멤버·현재 참가자) 반환. */
-  deleteRoom(roomId: string, accountId: string): { members: string[]; participants: string[] } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || room.ownerId !== accountId) return undefined
-    const members = [...room.members]
-    const participants = [...room.participants.keys()]
-    this.rooms.delete(roomId)
-    this.codeToId.delete(room.code)
-    this.savedAt.delete(roomId)
-    this.removeFile(roomId)
-    return { members, participants }
-  }
-
-  /**
-   * 관리자 강제 삭제 — 소유자 검증을 생략하고 방을 제거(권한 검사는 호출 측 relay 가 admin 으로 수행).
-   * 통지·정리에 쓰도록 소유자·멤버·현재 참가자를 반환. 없는 방이면 undefined.
-   */
-  adminDeleteRoom(roomId: string): { ownerId: string; members: string[]; participants: string[] } | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const ownerId = room.ownerId
-    const members = [...room.members]
-    const participants = [...room.participants.keys()]
-    this.rooms.delete(roomId)
-    this.codeToId.delete(room.code)
-    this.savedAt.delete(roomId)
-    this.removeFile(roomId)
-    return { ownerId, members, participants }
-  }
-
-  /**
-   * 한 계정이 소유한 모든 세션방 삭제(계정 탈퇴 연쇄). 각 방의 참가자 목록(강제 퇴장 통지용)과 함께 반환.
-   * 소유자가 사라진 방은 GM 권한을 행사할 주체가 없어 사실상 좀비 — 그래서 통째로 제거한다.
-   */
-  deleteOwnedBy(accountId: string): { id: string; participants: string[] }[] {
-    if (!accountId) return []
-    const out: { id: string; participants: string[] }[] = []
-    for (const room of [...this.rooms.values()]) {
-      if (room.ownerId !== accountId) continue
-      const participants = [...room.participants.keys()]
-      this.rooms.delete(room.id)
-      this.codeToId.delete(room.code)
-      this.savedAt.delete(room.id)
-      this.removeFile(room.id)
-      out.push({ id: room.id, participants })
-    }
-    return out
-  }
-
-  /** 세션 복사 — 소유자만. 장면(맵·자료·외형·BGM·카드)만 복제, 참가자·채팅·멤버는 초기화. 새 방 요약 반환. */
-  duplicateRoom(roomId: string, accountId: string): RoomSummary | undefined {
-    const src = this.rooms.get(roomId)
-    if (!src || src.ownerId !== accountId) return undefined
-    const id = randomUUID()
-    let code = genCode()
-    while (this.codeToId.has(code)) code = genCode()
-    const now = Date.now()
-    const maps = new Map<string, RoomMap>()
-    for (const m of src.maps.values()) {
-      const c = coerceLoadedMap(toWireMap(m)) // 깊은 복사(wire 왕복)
-      if (c) maps.set(c.id, c)
-    }
-    const handouts = new Map<string, Handout>()
-    for (const h of src.handouts.values()) handouts.set(h.id, { ...h })
-    const room: Room = {
-      id,
-      code,
-      title: src.title + ' (사본)',
-      ownerId: accountId,
-      gmIds: new Set(), // 사본은 만든 사람 혼자로 시작 — 원본의 공동 GM 을 자동으로 물려주지 않는다
-      members: new Set([accountId]),
-      cardImage: src.cardImage,
-      participants: new Map(),
-      characters: new Map(),
-      // 토큰은 그대로 복사되므로 보관대도 함께 옮긴다 — 아니면 복사한 방에서 토큰이 이름을 잃는다.
-      charPool: new Map(src.charPool),
-      handouts,
-      maps,
-      activeMapId: maps.has(src.activeMapId) ? src.activeMapId : (maps.keys().next().value as string),
-      appearance: { ...src.appearance },
-      cutInImage: src.cutInImage,
-      cutInImages: src.cutInImages ? { ...src.cutInImages } : undefined,
-      dimColor: src.dimColor,
-      madnessTables: src.madnessTables
-        ? {
-            realtimeTemp: [...src.madnessTables.realtimeTemp],
-            realtimeIndef: [...src.madnessTables.realtimeIndef],
-            summary: [...src.madnessTables.summary]
+          if (kind === 'furniture' && (dim.w > FURN_MAX || dim.h > FURN_MAX)) {
+            res.writeHead(400, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: `가구는 ${FURN_MAX}px 이하여야 해요.` }))
+            return
           }
-        : undefined,
-      insaneTables: src.insaneTables
-        ? Object.fromEntries(
-            Object.entries(src.insaneTables).map(([k, ov]) => [k, { ...ov, entries: [...ov.entries] }])
-          )
-        : undefined,
-      // 잠금은 복제본에 옮기지 않는다 — 복사한 방은 새로 준비하는 방이라 문을 열어 둔 채 시작한다.
-      luckEnabled: src.luckEnabled, // 행운 깎기 사용 여부 복제
-      vnOverlay: src.vnOverlay, // VN 오버레이 표시 여부 복제
-      plObjects: src.plObjects, // 참가자 오브젝트 추가 허용 여부 복제
-      gmSeeWhispers: src.gmSeeWhispers, // GM 귓속말 열람 여부 복제(대화는 복제하지 않으므로 각인은 따라가지 않는다)
-      // 덱은 정의만 옮기고 판은 처음부터 — 복사한 방은 새로 시작하는 방이다.
-      decks: src.decks?.map((d) => ({ ...d, cards: d.cards.map((c) => ({ ...c })), draw: shufflePile(deckPile(d.cards)), discard: [] })),
-      // 비주얼 카드도 옮긴다. 매어 둔 화자(for)는 보관대를 함께 복사하므로 사본에서도 그대로 가리킨다.
-      visualCards: src.visualCards?.map((c) => ({ ...c, ...(c.for ? { for: [...c.for] } : {}) })),
-      bgm: src.bgm.map((t) => ({ ...t })),
-      combat: null,
-      channels: new Map(),
-      messages: [],
-      charRooms: new Map(),
-      createdAt: now,
-      lastActivityAt: now
-    }
-    this.rooms.set(id, room)
-    this.codeToId.set(code, id)
-    void this.flush(room)
-    return this.summaryFor(room, accountId)
-  }
-
-  /** 세션 채팅 로그 전체 삭제 — 소유자만. 보관해 둔 지난 대화까지 함께 지운다. 성공 시 true. */
-  clearChat(roomId: string, accountId: string): boolean {
-    const room = this.rooms.get(roomId)
-    if (!room || room.ownerId !== accountId) return false
-    room.messages = []
-    room.lastActivityAt = Date.now()
-    this.journal(roomId, { op: 'clear' })
-    // '비우기'는 되돌릴 수 없는 손짓이다 — 보관소만 남겨 두면 '더 불러오기'로 지운 말이 도로 올라온다.
-    this.removeArchive(roomId)
-    void this.flush(room)
-    return true
-  }
-
-  participants(room: Room): Participant[] {
-    return [...room.participants.values()]
-  }
-
-  /** viewer 지정 시 handouts 는 그 사람이 볼 수 있는 것만(없으면 전체 — 테스트/하위호환용). */
-  snapshot(room: Room, viewer?: { playerId: string; role: Participant['role'] }): RoomState {
-    // 히스토리는 뷰어별로 걸러 내보낸다 — 귓속말·비밀 메시지가 제3자 스냅샷에 실리지 않게(와이어 노출 차단).
-    const visible = viewer
-      ? room.messages.filter((m) =>
-          canSeeMessage(m, viewer, (gid) => this.canAccessChannel(room.id, gid, viewer.playerId))
-        )
-      : room.messages
-    const { messages, avatarPool } = packAvatars(visible) // 채팅 두상 풀 분리 — 스냅샷 크기 절감
-    return {
-      id: room.id,
-      code: room.code,
-      title: room.title,
-      ownerId: room.ownerId,
-      gmIds: [...room.gmIds],
-      cardImage: room.cardImage,
-      participants: this.participants(room),
-      characters: [...room.characters.values()],
-      // 로스터에 없는(지금 아무도 장착하지 않은) 캐릭터도 함께 — 그 캐릭터의 토큰이 이름·수치를 그린다.
-      charPool: [...room.charPool.values()],
-      messages,
-      archived: this.hasArchive(room.id), // 이보다 앞선 대화가 보관소에 남아 있는가
-      avatarPool, // 채팅 두상 풀 — 클라가 avatarRef 복원에 사용
-      handouts: viewer ? this.handoutsFor(room, viewer) : [...room.handouts.values()],
-      // 공개범위에 따라 뷰어별 표현(앞면/뒷면/미표시)으로 변환한다(클라 은닉 신뢰 X · 와이어 노출 차단).
-      maps: [...room.maps.values()].map((m) => {
-        const wire = toWireMap(m)
-        if (!viewer) return wire
-        return {
-          ...wire,
-          tokens: wire.tokens.map((t) => tokenForViewer(t, viewer)).filter((t): t is Token => t !== null)
+          cleanFiles[key] = hash
         }
-      }),
-      activeMapId: room.activeMapId,
-      appearance: room.appearance,
-      cutInImage: room.cutInImage,
-      cutInImages: room.cutInImages,
-      dimColor: room.dimColor,
-      madnessTables: room.madnessTables, // GM 커스텀 광기표
-      insaneTables: room.insaneTables, // GM 커스텀 인세인 표
-      locked: room.locked, // 입실 잠금(공사중)
-      luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
-      vnOverlay: room.vnOverlay, // VN 오버레이 표시 여부
-      // 참가자 오브젝트 추가 허용 — 항상 불리언으로 실어, 필드 유무로 클라가 구서버(기능 없음)를 가려낸다.
-      plObjects: room.plObjects === true,
-      gmSeeWhispers: room.gmSeeWhispers, // GM 귓속말 열람 여부
-      bgm: room.bgm,
-      combat: room.combat,
-      channels: this.channelsFor(room, viewer),
-      charRoomIds: viewer ? (room.charRooms.get(viewer.playerId) ?? []) : [], // 요청자의 이 방 시트 멤버십
-      // 이 뷰어가 이미 고른 선택지(메시지 id → 옵션 id) — 재입장해도 잠금이 되살아난다.
-      // 없으면 이미 답한 사람에게 버튼이 다시 열리고, 눌러 본 항목이 '선택했습니다'로 잘못 남는다.
-      // 값이 빈 문자열이면 '고르긴 했는데 무엇인지 모른다'(구버전 저장본)는 뜻이다.
-      choiceLocks: viewer
-        ? Object.fromEntries(
-            [...(room.choices?.entries() ?? [])]
-              .filter(([, c]) => c.responders.has(viewer.playerId))
-              .map(([mid, c]) => [mid, c.responders.get(viewer.playerId) ?? ''])
-          )
-        : {},
-      saveSlots: this.slotMeta(room), // 저장 슬롯 메타(목록 표시용)
-      visualCards: room.visualCards ?? [], // 비주얼 카드 목록
-      decks: this.decksFor(room.id, viewer), // 덱 공개본(남은 더미의 순서는 빠진다)
-      // 통합 레이어 토큰 — 맵을 넘어 유지. 공개범위/양면/상태비공개 필터를 맵 토큰과 동일 적용.
-      globalTokens: room.globalTokens
-        ? viewer
-          ? [...room.globalTokens.values()]
-              .map((t) => tokenForViewer(t, viewer))
-              .filter((t): t is Token => t !== null)
-          : [...room.globalTokens.values()]
-        : []
-    }
-  }
-
-  /** 방 시트 멤버십: playerId 의 이 방 charId 목록(없으면 []). */
-  roomCharsFor(roomId: string, playerId: string): string[] {
-    return this.rooms.get(roomId)?.charRooms.get(playerId) ?? []
-  }
-
-  /** 방에 내 시트 추가. 이미 있으면 무시. 갱신된 목록 반환(없으면 undefined). */
-  addRoomChar(roomId: string, playerId: string, charId: string): string[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room || !charId) return undefined
-    const cur = room.charRooms.get(playerId) ?? []
-    if (!cur.includes(charId)) {
-      room.charRooms.set(playerId, [...cur, charId])
-      room.lastActivityAt = Date.now()
-    }
-    return room.charRooms.get(playerId) ?? []
-  }
-
-  /** 방에서 내 시트 제거(라이브러리 원본은 유지). 갱신된 목록 반환. */
-  removeRoomChar(roomId: string, playerId: string, charId: string): string[] | undefined {
-    const room = this.rooms.get(roomId)
-    if (!room) return undefined
-    const cur = room.charRooms.get(playerId) ?? []
-    room.charRooms.set(
-      playerId,
-      cur.filter((id) => id !== charId)
-    )
-    room.lastActivityAt = Date.now()
-    return room.charRooms.get(playerId) ?? []
-  }
-
-  /** 접속자 없이 maxIdleMs 이상 방치된 방 정리. 정리된 roomId 목록 반환. 영속 모드는 정리 안 함(소유자 삭제만). */
-  sweepStale(maxIdleMs: number, now = Date.now()): string[] {
-    if (this.persist) return []
-    const removed: string[] = []
-    for (const room of this.rooms.values()) {
-      const anyConnected = [...room.participants.values()].some((p) => p.connected)
-      if (!anyConnected && now - room.lastActivityAt > maxIdleMs) {
-        this.rooms.delete(room.id)
-        this.codeToId.delete(room.code)
-        removed.push(room.id)
-      }
-    }
-    return removed
-  }
-
-  /** 진단용. */
-  get roomCount(): number {
-    return this.rooms.size
-  }
-
-  /**
-   * 관리자 용량 산출 — 한 계정이 소유한 방들의 직렬화 바이트 합 + 참조 자산 해시 집합(방 개수 포함).
-   * 직렬화 형식은 디스크 저장(roomToFile)과 동일해 실제 점유와 거의 일치한다.
-   */
-  usageForOwner(accountId: string): {
-    count: number
-    bytes: number
-    refs: Set<string>
-    list: { id: string; title?: string; code: string; bytes: number }[]
-  } {
-    let bytes = 0
-    const refs = new Set<string>()
-    const list: { id: string; title?: string; code: string; bytes: number }[] = []
-    for (const room of this.rooms.values()) {
-      if (room.ownerId !== accountId) continue
-      try {
-        const json = JSON.stringify(roomToFile(room))
-        // 보관소도 이 방이 쓰는 자리다 — 빼고 세면 관리 화면의 용량이 실제보다 작게 보인다.
-        const b = Buffer.byteLength(json, 'utf8') + this.archiveBytes(room.id)
-        bytes += b
-        scanAssetRefs(json, refs)
-        collectAvatarHashes(room, refs)
-        list.push({ id: room.id, title: room.title, code: room.code, bytes: b })
-      } catch {
-        /* 직렬화 실패 방어 — 해당 방만 건너뜀 */
-      }
-    }
-    return { count: list.length, bytes, refs, list }
-  }
-
-  /**
-   * 보유한 전 방에서 참조 중인 'asset:<해시>' 를 into 에 수집(자산 GC 라이브 집합).
-   * 인메모리 방이 진실원본 — 디스크 flush 가 지연돼도(자동저장 주기) 최신 참조를 누락하지 않는다.
-   */
-  collectAssetRefs(into: Set<string>): void {
-    for (const room of this.rooms.values()) {
-      // 보관소로 옮겨 둔 대화가 붙잡고 있는 그림 — 메모리의 room.messages 에는 이미 없다.
-      // 이걸 빼먹으면 '아무도 안 쓰는 파일'로 판정돼, 대화는 되읽히는데 그림만 빈칸이 된다.
-      if (this.persist) for (const h of this.archiveRefSet(room.id)) into.add(h)
-      collectAvatarHashes(room, into)
-      try {
-        scanAssetRefs(JSON.stringify(roomToFile(room)), into)
-      } catch {
-        // 통째로는 문자열이 안 되는 방이다. 여기서 건너뛰면 그 방이 쓰는 이미지가 '아무도 안 쓴다'로
-        // 판정돼 주기 정리에 지워진다 — 방은 멀쩡한데 그림만 사라진다. 그러니 조각으로 나눠 훑는다.
-        try {
-          for (const m of room.messages) scanAssetRefs(JSON.stringify(m), into)
-        } catch {
-          /* 메시지 하나가 이미 한계를 넘는 지경 — 아래 나머지라도 훑는다 */
-        }
-        for (const part of [
-          () => [...room.maps.values()].map(toWireMap),
-          () => [...room.handouts.values()],
-          () => [...room.channels.values()],
-          // Map 을 그대로 넘기면 '{}' 로 직렬화돼 아무것도 못 훑는다 — 값 배열로 펴서 넘긴다.
-          () => [...room.characters.values()],
-          () => [...room.charPool.values()],
-          // ⚠ 덱 카드 그림을 여기 빠뜨리면 주기 자산 회수가 '쓰는 데 없는 파일'로 보고 지운다 — 덱은 멀쩡한데 그림만 사라진다.
-          () => [room.appearance, room.cutInImage, room.cutInImages, room.bgm, room.saveSlots, room.visualCards, room.decks]
-        ]) {
-          try {
-            scanAssetRefs(JSON.stringify(part()), into)
-          } catch {
-            /* 그 조각만 건너뜀 */
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * 멤버 본인 이전 — 이 계정이 소유한 모든 방을 영속 파일 형태(roomToFile = 전체 장면·채팅)로 내보낸다.
-   *
-   * ⚠ 채팅은 앱 화면과 **같은 열람 규칙**(canSeeMessage)으로 거른다. 귓속말이 방 기록에 영속되면서,
-   *   방장이라도 화면에서는 볼 수 없게 막아 둔 남의 귓속말이 내보내기 파일로는 원문 그대로 빠져나갔다.
-   *   저장(roomToFile)은 그대로 전부 담아야 하므로 여기서만 걸러 낸다.
-   */
-  exportOwnedBy(accountId: string): Record<string, unknown>[] {
-    if (!accountId) return []
-    const out: Record<string, unknown>[] = []
-    for (const room of this.rooms.values()) {
-      if (room.ownerId !== accountId) continue
-      // 방 소유자는 그 방의 GM 이다(지금 접속 중이 아니어도 재입장하면 GM).
-      const viewer = { playerId: accountId, role: room.participants.get(accountId)?.role ?? ('GM' as const) }
-      const visible = room.messages.filter((m) =>
-        canSeeMessage(
-          m,
-          viewer,
-          // 방장은 지금 접속 중이 아니어도 GM 이다 — 참가자 목록으로만 판정하면 자기 방 그룹 로그가 내보내기에서 빠진다.
-          // 지운 채널은 통과시키지 않는다(보관분을 거르는 archivedAll 과 같은 규칙이어야 두 길이 어긋나지 않는다).
-          (gid) =>
-            room.channels.has(gid) && (viewer.role === 'GM' || this.canAccessChannel(room.id, gid, accountId))
-        )
-      )
-      // 보관소로 옮겨 둔 지난 대화까지 함께 싣는다 — 계정을 옮기면서 세션 앞부분을 잃지 않게.
-      const archived = this.archivedAll(room.id, viewer)
-      if (archived.truncated)
-        console.warn(`[rooms] ${room.id}(${room.title}) 보관 대화가 너무 많아 내보내기에 최근 몫만 실었다.`)
-      // 상한 경계에서 서버가 갑자기 죽은 직후에는 같은 말이 보관소와 라이브 양쪽에 남아 있을 수 있다 —
-      // 파일에는 한 번만 싣는다(보관 쪽을 남겨야 시간순이 그대로다).
-      const packed = new Set(archived.messages.map((m) => m.id))
-      const live = packed.size ? visible.filter((m) => !packed.has(m.id)) : visible
-      // 남은 더미의 순서는 파일로도 내보내지 않는다 — 디스크 저장과 달리 이 파일은 사람 손에 들어간다.
-      // 되살릴 때는 순서가 없으므로 새로 섞인다(coerceDecks).
-      const decks = room.decks?.map(({ draw: _draw, ...rest }) => rest)
-      out.push(roomToFile({ ...room, decks, messages: [...archived.messages, ...live] } as Room))
-    }
-    return out
-  }
-
-  /**
-   * 멤버 본인 이전(가져오기) — 내보낸 방 파일들을 이 계정 소유로 복원한다. 새 id·고유 코드를 발급하고
-   * 소유자·멤버·참가자를 가져오는 계정만으로 재구성한다(옛 참가자 id 는 새 서버에 없으므로 코드로 재입장하게 둠).
-   * 장면·채팅 기록은 그대로 보존. 반환=복원된 방 수.
-   */
-  importOwnedBy(accountId: string, files: unknown, ownerNick: string): number {
-    if (!accountId || !Array.isArray(files)) return 0
-    let imported = 0
-    for (const f of files) {
-      if (imported >= 200) break // 안전 상한
-      const room = roomFromFile(f)
-      if (!room) continue
-      // 예전 판에서 만든 파일에는 같은 말이 두 번 실려 있을 수 있다 — 여기서 한 번만 남긴다.
-      if (room.messages.length) {
-        const seen = new Set<string>()
-        room.messages = room.messages.filter((m) => {
-          if (!m.id || seen.has(m.id)) return false
-          seen.add(m.id)
-          return true
+        const r = market.submit(account.id, account.nickname || account.username, {
+          kind,
+          name: body.name,
+          price: body.price,
+          files: cleanFiles,
+          layer: body.layer,
+          flippable: body.flippable
         })
-      }
-      const id = randomUUID()
-      let code = genCode()
-      while (this.codeToId.has(code)) code = genCode()
-      room.id = id
-      room.code = code
-      room.ownerId = accountId
-      // 공동 GM 은 옛 서버의 계정 id 라 이 서버에서는 남이거나 없는 사람이다 — 비우고 시작한다.
-      room.gmIds = new Set()
-      room.members = new Set([accountId])
-      room.participants = new Map<string, Participant>([
-        [
-          accountId,
-          { playerId: accountId, nick: (ownerNick || '탐사자').slice(0, 80), color: DEFAULT_PL_COLOR, role: 'GM', connected: false }
-        ]
-      ])
-      room.charRooms = new Map() // 시트 멤버십은 옛 playerId 기준이라 초기화(소유자가 방에 다시 추가)
-      room.lastActivityAt = Date.now()
-      this.rooms.set(id, room)
-      this.codeToId.set(code, id)
-      // 옛 서버에서 보관소에 있던 몫까지 함께 실려 오므로 방이 상한을 넘길 수 있다.
-      // 여기서 곧바로 이 서버의 보관소로 옮겨 둔다 — 안 그러면 입장 스냅샷이 통째로 그만큼 커진다.
-      this.evictOldest(room, MAX_HISTORY)
-      void this.flush(room) // 즉시 영속
-      imported++
+        if (r.ok) market.grantOwnership(account.id, r.item) // 창작자는 자기 작품을 보유(등록을 내려도 사용 가능)
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
     }
-    return imported
+    // 구매(member+) — 코인 이체(창작자 90% + 수수료 10% 소각) + 소유권. 본문 { token, itemId }.
+    if (req.method === 'POST' && req.url === '/dottown/market/buy') {
+      withBody(req, res, (body) => {
+        const account = requireMember(body, res)
+        if (!account) return
+        if (econLimited(account.id, res)) return
+        const itemId = typeof body.itemId === 'string' ? body.itemId : ''
+        const item = market.getItem(itemId)
+        if (!item || item.hidden) {
+          res.writeHead(404, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '판매 중이 아닌 아이템이에요.' }))
+          return
+        }
+        if (item.creatorId === account.id || market.owns(account.id, itemId)) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '이미 보유한 아이템이에요.' }))
+          return
+        }
+        if (item.price > 0) {
+          const fee = Math.floor((item.price * MARKET_FEE_PCT) / 100)
+          const r = economy.transfer(account.id, item.creatorId, item.price, fee)
+          if (!r.ok) {
+            res.writeHead(400, JSON_H)
+            res.end(JSON.stringify({ ok: false, error: r.error ?? '구매하지 못했어요.' }))
+            return
+          }
+          io.to('user:' + account.id).emit('dottown:coin', { balance: r.fromBalance })
+          io.to('user:' + item.creatorId).emit('dottown:coin', { balance: r.toBalance })
+        }
+        market.grantOwnership(account.id, item)
+        res.writeHead(200, JSON_H)
+        res.end(JSON.stringify({ ok: true, balance: economy.balanceOf(account.id) }))
+      })
+      return
+    }
+    // 등록 내리기(창작자 또는 관리자) — 본문 { token, itemId }.
+    if (req.method === 'POST' && req.url === '/dottown/market/remove') {
+      withBody(req, res, (body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, JSON_H)
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        if (econLimited(account.id, res)) return
+        const itemId = typeof body.itemId === 'string' ? body.itemId : ''
+        const r = market.remove(itemId, account.id, account.role === 'admin')
+        res.writeHead(r.ok ? 200 : 403, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
+    // 커뮤니티 — 맡았으면 응답까지 끝낸다. 정적 서빙보다 앞이어야 한다(뒤면 404 JSON 으로 흘러간다).
+    if (communityRoutes(req, res)) return
+
+    // 웹 클라이언트(웹판) 정적 서빙 — webRoot 의 실존 파일만. 그 외는 아래 404 JSON(구버전 감지 신호)로.
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url) {
+      const f = resolveWebFile(req.url)
+      if (f) {
+        // 재검증이 304 로 끝나게(약검증자 — 크기+수정시각. 재배포로 파일이 바뀌면 태그도 바뀐다).
+        if (req.headers['if-none-match'] === f.etag) {
+          const head304: Record<string, string> = { etag: f.etag }
+          // 304 에 빠진 헤더는 브라우저가 캐시본의 것을 그대로 쓴다. 정책만 바뀌고 파일은 그대로인 배포에서
+          // 옛 정책이 계속 적용되지 않도록, 재검증 응답에도 같은 정책을 실어 보낸다.
+          if (f.type.startsWith('text/html')) head304['content-security-policy'] = WEB_CSP
+          res.writeHead(304, head304)
+          res.end()
+          return
+        }
+        // 해시 파일명(assets/)은 불변 캐시, index.html·yt.html 등 이름 고정 파일은 항상 재검증(재배포 즉시 반영).
+        // ⚠ webRoot '상대' 경로로 판정 — 절대경로 검사면 상위 폴더명에 assets 가 있을 때 전부 불변 캐시가 된다.
+        const immutable = f.rel.startsWith(`assets${sep}`)
+        const head: Record<string, string | number> = {
+          'content-type': f.type,
+          'content-length': f.size,
+          etag: f.etag,
+          'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+          'x-content-type-options': 'nosniff'
+        }
+        // 문서에만 정책을 건다(스크립트·스타일 파일에 붙여 봐야 의미가 없고, 하위 리소스는 문서 정책을 따른다).
+        if (f.type.startsWith('text/html')) head['content-security-policy'] = WEB_CSP
+        res.writeHead(200, head)
+        if (req.method === 'HEAD') {
+          res.end()
+          return
+        }
+        const stream = createReadStream(f.path)
+        stream.on('error', () => res.destroy()) // 읽기 실패(전송 중 삭제 등) — 연결 종료
+        stream.pipe(res)
+        return
+      }
+    }
+    // 미매칭 라우트 — 빈 404 대신 사유를 JSON 으로 알려, 신버전 클라가 구버전 서버를 만났을 때
+    // '연결 불가'가 아니라 '서버 업데이트 필요'로 안내할 수 있게 한다.
+    res.writeHead(404, JSON_H)
+    res.end(JSON.stringify({ ok: false, error: '이 서버에 없는 기능입니다. 서버 프로그램을 최신 버전으로 업데이트해 주세요.' }))
+  }
+
+  // tls 제공 시 https(wss), 아니면 http(ws). 양쪽 다 동일 핸들러 사용.
+  const httpServer: HttpServer | HttpsServer = opts?.tls
+    ? createHttpsServer({ key: opts.tls.key, cert: opts.tls.cert }, handler)
+    : createServer(handler)
+
+  const io = new Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>(
+    httpServer,
+    {
+      // 화이트리스트 설정 시 일치 origin·무(無)origin만 허용, 미설정이면 전체(개발/로컬).
+      cors: corsOrigins ? { origin: (origin, cb) => cb(null, originAllowed(origin)) } : { origin: '*' },
+      // 소켓 프레임 상한. 정상 미디어는 /asset(HTTP)로 올려 'asset:' 참조(수십 바이트)로 오므로 소켓 메시지는 작다.
+      // 인라인이 남는 유일한 정상 경로는 캐릭터 두상(char:update — 개당 ≤~0.9MB × 최대 24 ≈ 22MB)뿐 → 그 위 여유로 48MB.
+      // 큰 미디어는 소켓이 아니라 /asset 업로드로만 받는다(단일 대용량 메시지가 이벤트 루프를 막는 것을 방지).
+      maxHttpBufferSize: 48 * 1024 * 1024,
+      // 하트비트: 죽은(half-open) 소켓을 빨리 감지해 '핑 타임아웃'(복구 가능 사유)으로 정리한다. 타임아웃이 길면
+      // 죽은 소켓을 한참 살아 있다고 착각해, 클라가 그 전에 새로 연결하면서 세션 복구가 실패(풀 재입장)할 수 있다.
+      // 큰 미디어는 /asset(HTTP)로 빠져 이벤트 루프가 길게 막히지 않으므로 짧은 타임아웃이 안전하다.
+      pingInterval: 20000,
+      pingTimeout: 30000,
+      // 세션 복구 — 잠깐 끊긴 재접속(2분 내)은 방·놓친 이벤트를 자동 복원해 대용량 스냅샷 재전송 없이 이어간다.
+      // 인증 미들웨어는 재실행(skipMiddlewares:false)해 토큰을 매 재접속마다 재검증.
+      connectionStateRecovery: {
+        maxDisconnectionDuration: 2 * 60 * 1000,
+        skipMiddlewares: false
+      }
+    }
+  )
+
+  // 도트타운 광장 허브 — 휘발 멀티플레이(인메모리). 100ms 틱을 광장 룸으로 송출. 종료 시 인터벌 정리.
+  const plaza = createPlazaHub({
+    onTick: (plazaId, tick) => io.to('plaza:' + plazaId).emit('plaza:tick', tick)
+  })
+  httpServer.on('close', () => plaza.dispose())
+
+  // 마이룸 실시간 방문 허브 — 방(roomId=소유자 id)별 휘발 프레즌스. 틱을 그 방 소켓룸(roomvisit:<id>)으로만 송출.
+  const roomVisit = createRoomPresenceHub({
+    onTick: (roomId, tick) => io.to('roomvisit:' + roomId).emit('roomvisit:tick', tick)
+  })
+  httpServer.on('close', () => roomVisit.dispose())
+
+  // 부동산 변경 반영 — 이동 차단셀(점유 건물) 갱신 + 광장 룸에 최신 20칸 전송.
+  broadcastLots = (): void => {
+    plaza.setLotBlocked(estate.blockedCells())
+    io.to('plaza:' + PLAZA_ID).emit('plaza:lots', { plazaId: PLAZA_ID, lots: estate.lots() })
+  }
+  plaza.setLotBlocked(estate.blockedCells()) // 시작 시 초기 차단셀
+  // 연체 월세 자동 퇴거 — 1분마다 스윕. 뺀 칸이 있으면 브로드캐스트(광장에서 건물만 사라짐 — 실제 마이룸은 보존).
+  const estateSweep = setInterval(() => {
+    if (estate.sweep().length) broadcastLots()
+  }, 60_000)
+  if (typeof estateSweep.unref === 'function') estateSweep.unref()
+  httpServer.on('close', () => clearInterval(estateSweep))
+
+  // 각 방의 플레이어별 현재 맵 위치 — key=roomId → (playerId → mapId). GM 위치 표시용(휘발·비영속).
+  const roomPositions = new Map<string, Map<string, string>>()
+  // 같은 구조의 플레이어별 현재 뷰(map|vn) — GM '이동' 메뉴에서 같은 맵 내 일반↔비주얼노벨 전환을 보이게 한다(휘발·비영속).
+  const roomViews = new Map<string, Map<string, 'map' | 'vn'>>()
+
+  // 핸드아웃 대상 라우팅 헬퍼(개인 룸 user:pid). pid 빈 배열이면 no-op(전체 브로드캐스트 방지).
+  const emitHandoutState = (pids: string[], h: Handout): void => {
+    if (pids.length) io.to(pids.map((p) => 'user:' + p)).emit('handout:state', h)
+  }
+  const emitHandoutRemove = (pids: string[], id: string): void => {
+    if (pids.length) io.to(pids.map((p) => 'user:' + p)).emit('handout:remove', { id })
+  }
+  const emitHandoutFocus = (pids: string[], id: string): void => {
+    if (pids.length) io.to(pids.map((p) => 'user:' + p)).emit('handout:focus', { id })
+  }
+
+  // 인증 미들웨어: 토큰 검증 → socket.data 에 account/playerId 부착. requireAuth 면 무효 토큰 연결 거부.
+  io.use((socket, next) => {
+    const hs = socket.handshake.auth as { token?: unknown; playerId?: unknown }
+    const account = typeof hs?.token === 'string' ? auth.verifyToken(hs.token) : null
+    if (requireAuth && !account) {
+      next(new Error('AUTH_REQUIRED'))
+      return
+    }
+    socket.data.account = account ?? undefined
+    socket.data.playerId = account
+      ? account.id
+      : typeof hs?.playerId === 'string' && hs.playerId
+        ? hs.playerId
+        : randomUUID()
+    next()
+  })
+
+  io.on('connection', (socket) => {
+    // playerId/account 는 인증 미들웨어가 socket.data 에 채워둠.
+    const playerId = socket.data.playerId
+
+    /**
+     * 소켓 이벤트 등록 — socket.on 대신 이 창구를 쓴다.
+     *
+     * 핸들러가 던지거나(동기) 거부해도(async) 그 요청 하나만 실패하고 서버는 계속 산다.
+     * 맨 socket.on 은 예외를 받아 주는 곳이 없어, 요청 하나의 실수가 프로세스째 내려 그 서버에
+     * 붙어 있던 사람 전원을 끊는다. 이벤트 이름·페이로드 계약은 그대로 socket.on 이 강제한다.
+     */
+    const on = ((event: string, handler: (...args: unknown[]) => unknown) =>
+      socket.on(
+        event as never,
+        ((...args: unknown[]) => {
+          try {
+            const r = handler(...args)
+            if (r instanceof Promise) r.catch((e: unknown) => log('handler-error', event, e))
+          } catch (e) {
+            log('handler-error', event, e)
+          }
+        }) as never
+      )) as unknown as typeof socket.on
+
+    // 같은 기기의 죽은 옛 소켓은 강제로 끊지 않고 pingTimeout(위 Server 옵션)으로 스스로 정리되게 둔다 —
+    // 강제 종료 사유는 복구 불가라 connectionStateRecovery 의 세션 저장을 막지만, 핑 타임아웃은 복구 가능
+    // 사유라 다음 재접속이 세션 복구로 이어진다.
+    log(
+      'connect',
+      playerId.slice(0, 8),
+      'sockets',
+      io.sockets.sockets.size,
+      'rssMB',
+      Math.round(process.memoryUsage().rss / 1048576)
+    )
+
+    // 모든 연결: 개인 룸 입장 — DM·귓속말·핸드아웃 타깃은 이 룸으로 전달된다. 방 입장 핸들러도 조인하지만,
+    // 방 밖(로비)에서도 DM 을 받으려면 '연결 시점'에 미리 들어가 있어야 한다(조인은 멱등).
+    void socket.join('user:' + playerId)
+
+    // 인증 계정: 개인 계정 룸 입장 + 캐릭터 라이브러리 전송(다기기 영속 동기화 기반) + 전역 프레즌스 등록.
+    const account = socket.data.account
+    if (account) {
+      void socket.join('acct:' + account.id)
+      auth.touchSeen(account.id) // 마지막 접속 기록(연결 시점 — 종료 시점은 disconnect 에서)
+      // 라이브러리 전송은 '새(콜드) 연결'에만 — connectionStateRecovery 로 '복구된' 재접속(아래 socket.recovered 처리)은
+      // 클라가 이미 캐릭터를 들고 있으므로, 전체 라이브러리를 다시 밀어 넣으면 편집 중인 시트를 옛 스냅샷으로 덮는다(글자 사라짐).
+      if (!socket.recovered) socket.emit('char:library', characters.list(account.id))
+      // 전역 프레즌스: 이 계정의 소켓 집합에 추가. 표시 상태가 바뀌면 전체 알림(invisible 이면 무음 — 오프라인 위장).
+      const set = presence.get(account.id) ?? new Set<string>()
+      set.add(socket.id)
+      presence.set(account.id, set)
+      syncPresence(account.id)
+      // 접속자에게 현재 스냅샷 — online 은 위장 반영, statuses 는 'online' 아닌 항목만, self 는 내 실상태(본인 UI 시드).
+      const statuses: Record<string, PublicPresenceStatus> = {}
+      const onlineIds: string[] = []
+      for (const id of presence.keys()) {
+        if (!visibleOnline(id)) continue
+        onlineIds.push(id)
+        const st = publicStatus(id)
+        if (st && st !== 'online') statuses[id] = st
+      }
+      // self 는 '수동' 상태만 시드 — 실효값(자동 session)을 보내면 재접속 시 그 파생값이 클라 '내 상태'로 고착된다.
+      socket.emit('dm:presence:init', { online: onlineIds, statuses, self: auth.getStatus(account.id) ?? 'online' })
+      // 현재 등급을 1회 동기화 — 오프라인 중 관리자가 등급을 바꿔 role:changed 푸시를 놓쳤어도, 재접속 시
+      // 클라 UI(손님 배너·게이팅)가 stale 로 남지 않게 한다. applyRole 가 동일 값이면 무시하므로 비용 없음.
+      socket.emit('role:changed', { role: account.role })
+    }
+
+    const broadcastParticipants = (roomId: string): void => {
+      const room = store.getRoom(roomId)
+      if (room) io.to(roomId).emit('room:participants', store.participants(room))
+    }
+    // 각 플레이어의 현재 맵 위치를 GM 들에게만 집계 전달. 참가자 목록에 있는 위치만 포함(이탈자 자동 제외).
+    const emitPositions = (roomId: string): void => {
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const pos = roomPositions.get(roomId)
+      const vws = roomViews.get(roomId)
+      const positions: Record<string, string> = {}
+      const views: Record<string, 'map' | 'vn'> = {}
+      if (pos) for (const [pid, mid] of pos) if (room.participants.has(pid)) positions[pid] = mid
+      if (vws) for (const [pid, v] of vws) if (room.participants.has(pid)) views[pid] = v
+      for (const p of room.participants.values()) {
+        if (p.role === 'GM') io.to('user:' + p.playerId).emit('room:positions', { positions, views })
+      }
+    }
+
+    // 세션 복구 재접속(connectionStateRecovery) — socket.rooms·socket.data·놓친 이벤트가 자동 복원됨.
+    // 따라서 클라가 재입장(room:join)으로 대용량 스냅샷을 다시 받지 않아도 되고, 여기선 브리프 끊김 때
+    // markDisconnected 로 connected=false 됐던 온라인 표시만 되돌린다(+ GM 위치 집계 갱신).
+    if (socket.recovered && socket.data.roomId) {
+      if (store.markConnected(socket.data.roomId, playerId)) broadcastParticipants(socket.data.roomId)
+      emitPositions(socket.data.roomId)
+      // connected 복원 뒤 실효 상태 재브로드캐스트 — 연결 초기 syncPresence 는 connected=false 시점이라
+      // '세션중'이 'online'으로 어긋난 채 고착된다(room:join 정상 경로와 동일하게 맞춤).
+      if (account) syncPresence(account.id)
+      log(
+        'recovered',
+        playerId.slice(0, 8),
+        socket.data.roomId.slice(0, 8),
+        'sockets',
+        io.sockets.sockets.size
+      )
+    }
+
+    // 현재 소켓의 세션방 소속을 끊는 공통 정리 — room:leave 와 '다른 방 입장 시 자동 퇴장'이 공유한다.
+    // 이전 방의 소켓룸에 남은 채 새 방에 들어가면(직전 room:leave 유실 등) 두 방 방송을 동시에 받아
+    // 이전 방의 BGM 이 새 방에서 들리므로, 새 방 배정 전에 반드시 여기로 소속을 정리한다.
+    const leaveCurrentRoom = (): void => {
+      const roomId = socket.data.roomId
+      if (!roomId) return
+      void socket.leave(roomId)
+      // 퇴장은 계정 단위(참가자 한 칸)라, 아래 store.leave 로 이 계정이 방에서 통째로 빠진다.
+      // 같은 계정의 다른 창을 그대로 두면 참가자 목록에 없는 채 화면만 켜져 있는 유령이 된다
+      // (발화가 무음으로 사라지고 귓속말도 못 받는다). 추방·멤버십 해제와 같은 방식으로 알리고 소속을 정리한다.
+      // 이 함수는 '나가기'와 '다른 방에 들어가며 이전 방 자동 퇴장' 양쪽에서 불리므로 문구는 둘 다에 맞춘다.
+      for (const s of io.sockets.sockets.values()) {
+        if (s.id !== socket.id && s.data.playerId === playerId && s.data.roomId === roomId) {
+          s.emit('room:closed', '다른 창에서 이 세션을 떠났습니다.')
+          s.data.roomId = undefined
+          void s.leave(roomId)
+        }
+      }
+      const remaining = store.leave(roomId, playerId)
+      // 휘발 위치·뷰맵 정리: 방이 사라졌으면 통째로, 아니면 떠난 플레이어 항목만 제거(누수 방지).
+      if (!remaining) {
+        roomPositions.delete(roomId)
+        roomViews.delete(roomId)
+      } else {
+        roomPositions.get(roomId)?.delete(playerId)
+        roomViews.get(roomId)?.delete(playerId)
+      }
+      socket.data.roomId = undefined
+      broadcastParticipants(roomId)
+    }
+
+    on('room:create', async (req, ack) => {
+      // 손님(승인 대기)은 세션방을 만들 수 없다(호스팅 용량 보호). 멤버·관리자만 생성하며 생성자가 그 방의 GM(소유자).
+      if (socket.data.account?.role === 'guest') {
+        ack?.({ ok: false, error: '손님 계정은 세션방을 만들 수 없습니다. 관리자 승인 후 이용해 주세요.' })
+        return
+      }
+      const { room, self } = store.createRoom({
+        playerId,
+        nick: req?.nick ?? '',
+        color: req?.color ?? '',
+        accountId: socket.data.account?.id,
+        title: typeof req?.title === 'string' ? req.title : undefined,
+        cardImage: typeof req?.cardImage === 'string' ? req.cardImage : undefined
+      })
+      if (socket.data.roomId && socket.data.roomId !== room.id) leaveCurrentRoom() // 이전 방 자동 퇴장(이중 소속 차단)
+      socket.data.roomId = room.id
+      void socket.join(room.id)
+      void socket.join('user:' + playerId) // 개인 룸(귓속말/비밀/추방/핸드아웃 타깃)
+      if (socket.data.account) syncPresence(socket.data.account.id) // '세션중' 자동 파생
+      ack?.({ ok: true, data: { self, room: await lightenAvatarPool(store.snapshot(room, self)) } })
+      broadcastParticipants(room.id)
+      emitPositions(room.id) // 입장 GM 에게 현재 위치 집계 전달
+    })
+
+    on('room:join', async (req, ack) => {
+      if (!req?.code) {
+        ack?.({ ok: false, error: '초대 코드를 입력하세요.' })
+        return
+      }
+      const res = store.joinByCode(req.code, {
+        playerId,
+        nick: req.nick ?? '',
+        color: req.color ?? '',
+        accountId: socket.data.account?.id
+      })
+      if ('error' in res) {
+        ack?.({ ok: false, error: res.error })
+        return
+      }
+      if (socket.data.roomId && socket.data.roomId !== res.room.id) leaveCurrentRoom() // 이전 방 자동 퇴장(이중 소속 차단)
+      socket.data.roomId = res.room.id
+      void socket.join(res.room.id)
+      void socket.join('user:' + playerId) // 개인 룸(귓속말/비밀/추방/핸드아웃 타깃)
+      if (socket.data.account) syncPresence(socket.data.account.id) // '세션중' 자동 파생
+      const snap = await lightenAvatarPool(store.snapshot(res.room, res.self))
+      // 재입장 착지 맵 — 이 플레이어가 마지막으로 보고한 맵(room:where)이 살아 있으면 거기로.
+      const last = roomPositions.get(res.room.id)?.get(playerId)
+      if (last && res.room.maps.has(last)) snap.activeMapId = last
+      ack?.({ ok: true, data: { self: res.self, room: snap } })
+      broadcastParticipants(res.room.id)
+      emitPositions(res.room.id)
+    })
+
+    // ===== 세션방 목록·관리 (서버 영속) — 전부 인증 계정 기준. 메타/삭제/복사/채팅삭제=소유자 =====
+    on('room:list', (ack) => {
+      const acct = socket.data.account
+      ack?.({ ok: true, data: acct ? store.listForAccount(acct.id) : [] })
+    })
+
+    on('room:enter', async (req, ack) => {
+      if (!req?.roomId) {
+        ack?.({ ok: false, error: '세션을 선택하세요.' })
+        return
+      }
+      const res = store.enterRoom(req.roomId, {
+        playerId,
+        nick: req.nick ?? '',
+        color: req.color ?? '',
+        accountId: socket.data.account?.id
+      })
+      if ('error' in res) {
+        ack?.({ ok: false, error: res.error })
+        return
+      }
+      if (socket.data.roomId && socket.data.roomId !== res.room.id) leaveCurrentRoom() // 이전 방 자동 퇴장(이중 소속 차단)
+      socket.data.roomId = res.room.id
+      void socket.join(res.room.id)
+      void socket.join('user:' + playerId)
+      if (socket.data.account) syncPresence(socket.data.account.id) // '세션중' 자동 파생
+      ack?.({ ok: true, data: { self: res.self, room: await lightenAvatarPool(store.snapshot(res.room, res.self)) } })
+      broadcastParticipants(res.room.id)
+      emitPositions(res.room.id)
+    })
+
+    on('room:setMeta', (req, ack) => {
+      const acct = socket.data.account
+      if (!acct || !req?.roomId) {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      const sum = store.setMeta(req.roomId, acct.id, { title: req.title, cardImage: req.cardImage })
+      if (!sum) {
+        ack?.({ ok: false, error: '세션을 수정할 수 없습니다(소유자만).' })
+        return
+      }
+      ack?.({ ok: true, data: sum })
+    })
+
+    on('room:delete', (req, ack) => {
+      const acct = socket.data.account
+      if (!acct || !req?.roomId) {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      const res = store.deleteRoom(req.roomId, acct.id)
+      if (!res) {
+        ack?.({ ok: false, error: '세션을 삭제할 수 없습니다(소유자만).' })
+        return
+      }
+      // 입장 중인 참가자 강제 퇴장.
+      for (const pid of res.participants) {
+        io.to('user:' + pid).emit('room:closed', '세션이 삭제되었습니다.')
+        void io.in('user:' + pid).socketsLeave(req.roomId)
+        syncPresence(pid) // '세션중' 표시 해제(inSession 이 store 재검증이라 roomId 잔존해도 안전)
+      }
+      ack?.({ ok: true, data: { id: req.roomId } })
+    })
+
+    // 참가자 본인의 멤버십 탈퇴 — '내 세션 목록'에서 제거(소유자는 불가). 같은 초대 코드로 재참가 가능.
+    on('room:leaveMembership', (req, ack) => {
+      const acct = socket.data.account
+      if (!acct || !req?.roomId) {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      const r = store.leaveMembership(req.roomId, acct.id, playerId)
+      if ('error' in r) {
+        ack?.({ ok: false, error: r.error })
+        return
+      }
+      // 같은 계정의 '다른 기기'가 이 방에 입장 중이면 통지 + 소켓 상태 정리 — 무통지로 브로드캐스트만 끊기면
+      // 그 기기 화면이 소리 없이 정지하고(채팅도 무음 소실) stale roomId 가 방별 시트 멤버십을 오염시킨다.
+      for (const s of io.sockets.sockets.values()) {
+        if (s.id !== socket.id && s.data.playerId === playerId && s.data.roomId === req.roomId) {
+          s.emit('room:closed', '이 세션에서 나갔습니다.')
+          s.data.roomId = undefined
+        }
+      }
+      // 지금 그 방에 입장 중이었다면 소켓도 정리(다른 기기 포함).
+      void io.in('user:' + playerId).socketsLeave(req.roomId)
+      if (socket.data.roomId === req.roomId) socket.data.roomId = undefined
+      roomPositions.get(req.roomId)?.delete(playerId)
+      roomViews.get(req.roomId)?.delete(playerId)
+      broadcastParticipants(req.roomId) // 남은 인원에게 참가자 목록 갱신
+      // 스스로 나간 사람이 공동 GM 이었다면 자격도 함께 걷혔다 — 남은 사람들 화면의 GM 표시를 맞춘다.
+      const left = store.getRoom(req.roomId)
+      if (left) io.to(req.roomId).emit('room:gm', { ownerId: left.ownerId, gmIds: [...left.gmIds] })
+      syncPresence(acct.id)
+      ack?.({ ok: true, data: { id: req.roomId } })
+    })
+
+    on('room:duplicate', (req, ack) => {
+      const acct = socket.data.account
+      if (!acct || !req?.roomId) {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      if (acct.role === 'guest') {
+        ack?.({ ok: false, error: '손님 계정은 세션방을 만들 수 없습니다.' })
+        return
+      }
+      const sum = store.duplicateRoom(req.roomId, acct.id)
+      if (!sum) {
+        ack?.({ ok: false, error: '세션을 복사할 수 없습니다(소유자만).' })
+        return
+      }
+      ack?.({ ok: true, data: sum })
+    })
+
+    on('room:clearChat', (req, ack) => {
+      const acct = socket.data.account
+      if (!acct || !req?.roomId) {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      if (!store.clearChat(req.roomId, acct.id)) {
+        ack?.({ ok: false, error: '채팅을 비울 수 없습니다(소유자만).' })
+        return
+      }
+      io.to(req.roomId).emit('chat:clear') // 입장 중이면 로컬 채팅도 비움
+      ack?.({ ok: true, data: { id: req.roomId } })
+    })
+
+    // ===== GM 지정·양도 — 방을 만든 사람만 =====
+    // 방 안에서 벌어지는 일이므로 대상은 socket.data.roomId 의 참가자로 한정한다.
+    // 성공하면 참가자 목록(role)과 GM 명단을 함께 방송한다 — 둘 중 하나만 보내면 화면이 어긋난다.
+    const broadcastGm = async (roomId: string): Promise<void> => {
+      const room = store.getRoom(roomId)
+      if (!room) return
+      io.to(roomId).emit('room:gm', { ownerId: room.ownerId, gmIds: [...room.gmIds] })
+      broadcastParticipants(roomId)
+      // 방 스냅샷은 보는 사람의 자격에 따라 걸러서 만들어진다 — 숨긴 토큰, GM 자료, 남의 그룹 대화,
+      // 비밀·귓속말 기록이 저마다 다르게 실린다. 자격만 바꾸고 스냅샷을 그대로 두면 새 GM 은 볼
+      // 권한이 생겼는데 화면에는 없고, 내려온 사람은 권한이 없어졌는데 화면에는 남는다.
+      // 그래서 방 전원에게 각자의 몫으로 다시 보낸다(room:load 가 쓰는 그 길 그대로).
+      for (const p of room.participants.values()) {
+        io.to('user:' + p.playerId).emit('room:sync', await lightenAvatarPool(store.snapshot(room, p)))
+      }
+    }
+
+    on('room:gm:set', async (req, ack) => {
+      const roomId = socket.data.roomId
+      const acct = socket.data.account
+      if (!roomId || !acct || typeof req?.playerId !== 'string') {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      const r = store.setGm(roomId, acct.id, req.playerId, req.gm === true)
+      if ('error' in r) {
+        ack?.({ ok: false, error: r.error })
+        return
+      }
+      await broadcastGm(roomId)
+      ack?.({ ok: true, data: { ok: true } })
+    })
+
+    on('room:gm:transfer', async (req, ack) => {
+      const roomId = socket.data.roomId
+      const acct = socket.data.account
+      if (!roomId || !acct || typeof req?.playerId !== 'string') {
+        ack?.({ ok: false, error: '권한이 없습니다.' })
+        return
+      }
+      const r = store.transferOwner(roomId, acct.id, req.playerId)
+      if ('error' in r) {
+        ack?.({ ok: false, error: r.error })
+        return
+      }
+      await broadcastGm(roomId)
+      ack?.({ ok: true, data: { ok: true } })
+    })
+
+    /**
+     * 이 메시지의 화자 — 요청에 charId 가 실려 있으면 본인 몫의 보관대(charPool)에서 그 캐릭터를 찾는다
+     * (창마다 다른 화자로 말하는 길). 장착 슬롯과 같은 캐릭터면 슬롯(최신 표정)을 쓰고, 없거나 못 찾으면
+     * 예전대로 장착 슬롯이다. 보관대 키가 (playerId, charId) 라 남의 캐릭터는 애초에 닿지 않는다.
+     */
+    const speakerFor = (roomId: string, charId: unknown): SharedCharacter | undefined => {
+      const slot = store.getRoom(roomId)?.characters.get(playerId)
+      const want = typeof charId === 'string' && charId ? charId : ''
+      if (!want) return slot
+      if (slot && slot.charId === want) return slot
+      return store.pooledCharacter(roomId, playerId, want) ?? slot
+    }
+
+    on('chat:send', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return // 방에 속하지 않은 소켓은 무시 (위조 방지)
+
+      let raw = (typeof req.text === 'string' ? req.text : '').slice(0, MAX_CHAT_CHARS)
+      // 손님(guest) 계정은 채팅 이미지 불가 — [img=...] 마크업을 서버에서 제거(클라 UI 숨김의 우회 방지).
+      // 색·크기·기울임·굵기 등 다른 꾸미기는 그대로 허용. 멤버·관리자·GM 은 이미지 허용.
+      if (socket.data.account?.role === 'guest') raw = raw.replace(/\[img=[^\]]*\]/gi, '')
+      if (!raw.trim()) return
+
+      // 서버 권위 다이스: 명령이면 서버가 굴리고, 아니면 평문 메시지.
+      // author/color/playerId 는 서버가 참가자 정보로 스탬프 (클라 전송값 무시 → 위조 방지).
+      // script(/desc)는 꾸미기 본문이므로 다이스로 해석하지 않음.
+      const isScript = req.script === true
+      const dice = isScript ? null : parseCommand(raw)
+      const id = randomUUID()
+      const time = Date.now()
+      const channel = req.channel ?? 'main'
+      const secret = req.secret === true
+      // GM 1회성 NPC: GM 이고 npcName 이 있으면 그 이름으로 발화, 투명 두상(아바타·이름색 없음). PL 은 무시(위조 방지).
+      const npcName =
+        sender.role === 'GM' && typeof req.npcName === 'string' ? req.npcName.trim().slice(0, 60) : ''
+      const isNpc = npcName.length > 0
+      // author/color 는 현재 발화 정체성(프레즌스 = 오너 또는 장착 캐릭터)을 우선 반영, 없으면 참가자 폴백.
+      // 요청에 charId 가 실려 있으면 보관대에서 그 캐릭터를 화자로 쓴다(창마다 다른 화자).
+      const identity = isNpc ? undefined : speakerFor(roomId, req.charId)
+      const author = isNpc ? npcName : identity?.name || sender.nick
+      const color = isNpc ? '#8b93a7' : identity?.color || sender.color
+      // 발화 당시 두상·이름색을 메시지에 각인 — 영속·재시작·새 참가자에도 채팅 두상 보존. NPC 는 투명 두상이라 미설정.
+      // 두상이 없으면 빈 문자열('')을 각인한다 — '없음'을 확정해 두지 않으면 클라가 렌더 때마다 현재 상태를
+      // 재조회해, 나중에 인장을 넣거나 화자를 바꾸는 순간 과거 메시지의 두상이 소급해 바뀐다.
+      const avatar = isNpc ? undefined : (presenceHeadshot(identity) ?? '')
+      const nameColor = isNpc ? undefined : identity?.nameColor
+      const speakerCharId = isNpc ? undefined : identity?.charId || undefined
+      const base = {
+        id,
+        time,
+        channel,
+        author,
+        playerId,
+        ...(speakerCharId ? { charId: speakerCharId } : {}),
+        color,
+        avatar,
+        nameColor,
+        ...(isNpc ? { npc: true as const } : {})
+      }
+      const message: ChatMessage = dice
+        ? { ...base, kind: 'dice', dice }
+        : {
+            ...base,
+            kind: isScript ? 'script' : req.narration ? 'narration' : 'speech',
+            // 인라인 굴림 [[1d100]] 을 서버 권위로 1회 해석 → 전원 같은 숫자. 채팅·스크립트 공통.
+            text: resolveInlineRolls(raw.trim())
+          }
+
+      // ── 대상 필터링: 개인 룸(user:playerId)으로 라우팅. 히스토리에는 저장하되(재입장 보존)
+      //    내보낼 때 뷰어별로 걸러(store.snapshot) 제3자에게는 실리지 않는다. ──
+      if (secret) {
+        // 비밀 굴림/메시지: GM + 본인에게만.
+        message.secret = true
+        store.addMessage(roomId, message)
+        io.to(secretTargets(room, playerId)).emit('chat:new', message)
+        return
+      }
+      if (channel === 'whisper' && typeof req.to === 'string' && req.to) {
+        // 귓속말: 발신자 + 대상에게만(방 안의 대상만). 방이 GM 열람을 켜 두었으면 그 사실을 말에 각인해
+        // GM 에게도 보낸다 — 각인은 발화 시점에만 찍히므로 나중에 켜도 지난 말은 열리지 않는다.
+        if (!room.participants.has(req.to)) return
+        message.to = req.to
+        if (room.gmSeeWhispers === true) message.gmVisible = true
+        store.addMessage(roomId, message)
+        io.to(whisperTargets(room, message)).emit('chat:new', message)
+        return
+      }
+      if (channel === 'group' && typeof req.groupId === 'string' && req.groupId) {
+        // 그룹 채널: 히스토리에 저장하고 멤버 + GM 의 개인 룸으로만 보낸다(열람은 내보낼 때 뷰어별로 거른다).
+        // 발신 권한 검증(멤버/GM).
+        if (!store.canAccessChannel(roomId, req.groupId, playerId)) return
+        message.groupId = req.groupId
+        store.addMessage(roomId, message)
+        const targets = store.channelRecipients(roomId, req.groupId).map((id) => 'user:' + id)
+        if (targets.length) io.to(targets).emit('chat:new', message)
+        return
+      }
+      // 공개: 히스토리 저장 + 방 전체 브로드캐스트.
+      store.addMessage(roomId, message)
+      io.to(roomId).emit('chat:new', message)
+      // 비주얼 카드 트리거 — 텍스트(발화·지문·스크립트)는 마크업을 벗긴 본문에 카드 이름이 '포함'되면,
+      // 주사위는 결과 라벨(성공/실패/단계)이 카드 이름과 정확히 일치하면 전원 오버레이 재생.
+      // 한 발화에 컷인 1개(포함 매칭은 긴 이름 우선). 발화 순간 1회만 emit 하므로 히스토리 재생·재입장에는
+      // 다시 뜨지 않는다(클라 오버레이도 nonce 로 과거 트리거를 무시).
+      // 화자는 서버가 방금 각인한 값을 그대로 넘긴다 — 카드에 화자를 매어 두었으면 그 사람이 말할 때만 뜬다.
+      const speaker = cardSpeakerOf(message)
+      if ('text' in message && message.text) {
+        const card = store.findCardInText(roomId, message.text, speaker)
+        if (card) io.to(roomId).emit('room:cardplay', { card })
+      } else if (message.kind === 'dice' && message.dice) {
+        // 라벨 굴림(예: "CC<=60 (근력)")은 기능명이 카드 이름과 겹칠 수 있어 원문 포함 매칭을
+        // 우선한다 — 평문 발화의 카드 트리거와 동일 규칙. 무라벨 명령은 결과 라벨 키워드만 본다.
+        const named =
+          'name' in message.dice && message.dice.name
+            ? store.findCardInText(roomId, message.dice.command, speaker)
+            : undefined
+        if (named) {
+          io.to(roomId).emit('room:cardplay', { card: named })
+        } else {
+          const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords(), speaker)
+          if (card) io.to(roomId).emit('room:cardplay', { card })
+        }
+      }
+    })
+
+    // ===== 클라가 굴린 결과 중계 (시트 주사위·광기) =====
+    // chat:send 와 달리 서버가 재굴림하지 않고 payload(dice/madness)를 신뢰해 그대로 브로드캐스트
+    // (라벨·광기표 등 서버가 재현 못하는 결과 보존). author/color/playerId 는 서버가 정체성으로 스탬프(위조 방지).
+    on('chat:roll', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return // 방 밖 소켓 무시 (위조 방지)
+
+      const kind = req.kind === 'madness' ? 'madness' : 'dice'
+      const dice = kind === 'dice' && req.dice && typeof req.dice === 'object' ? req.dice : undefined
+      const madness =
+        kind === 'madness' && req.madness && typeof req.madness === 'object' ? req.madness : undefined
+      if (!dice && !madness) return // 빈/잘못된 payload 무시
+
+      const id = randomUUID()
+      const time = Date.now()
+      const channel = req.channel ?? 'main'
+      const secret = req.secret === true
+      // 시트 굴림은 그 시트의 캐릭터(charId)가 화자다 — 장착과 무관하게 굴린 시트대로 각인된다.
+      const identity = speakerFor(roomId, req.charId)
+      const author = identity?.name || sender.nick
+      const color = identity?.color || sender.color
+      const avatar = presenceHeadshot(identity) ?? '' // 발화 당시 두상 각인('' = 인장 없음 확정)
+      const nameColor = identity?.nameColor
+      const speakerCharId = identity?.charId || undefined
+      const stamp = { id, time, channel, author, playerId, ...(speakerCharId ? { charId: speakerCharId } : {}), color, avatar, nameColor }
+      const message: ChatMessage = dice
+        ? { ...stamp, kind: 'dice', dice }
+        : { ...stamp, kind: 'madness', madness }
+
+      // 라우팅(chat:send 와 동일): 비밀=GM+본인, 귓속말=대상+본인, 그 외 공개=방 전체. 전부 히스토리 저장.
+      if (secret) {
+        message.secret = true
+        store.addMessage(roomId, message)
+        io.to(secretTargets(room, playerId)).emit('chat:new', message)
+        return
+      }
+      if (channel === 'whisper' && typeof req.to === 'string' && req.to) {
+        if (!room.participants.has(req.to)) return
+        message.to = req.to
+        if (room.gmSeeWhispers === true) message.gmVisible = true
+        store.addMessage(roomId, message)
+        io.to(whisperTargets(room, message)).emit('chat:new', message)
+        return
+      }
+      if (channel === 'group' && typeof req.groupId === 'string' && req.groupId) {
+        // 그룹 채널: 히스토리에 저장하고 멤버 + GM 의 개인 룸으로만 보낸다(열람은 내보낼 때 뷰어별로 거른다).
+        // 발신 권한 검증(멤버/GM).
+        if (!store.canAccessChannel(roomId, req.groupId, playerId)) return
+        message.groupId = req.groupId
+        store.addMessage(roomId, message)
+        const targets = store.channelRecipients(roomId, req.groupId).map((id) => 'user:' + id)
+        if (targets.length) io.to(targets).emit('chat:new', message)
+        return
+      }
+      store.addMessage(roomId, message)
+      io.to(roomId).emit('chat:new', message)
+      // 시트 굴림도 결과 라벨(성공/실패/단계)로 비주얼 카드 발동 — 공개 굴림만, 광기(madness)는 라벨 없음.
+      if (message.kind === 'dice' && message.dice) {
+        // 시트·팔레트에서 굴린 것도 채팅에 직접 친 판정과 같은 규칙으로 카드를 찾는다.
+        // ⚠ 화자를 여기에도 넘겨야 한다. 한 곳만 넘기면 '채팅으로 친 판정은 화자별로 뜨는데
+        //    시트에서 굴린 판정은 전원에게 뜨는' 어긋남이 남는다.
+        const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords(), cardSpeakerOf(message))
+        if (card) io.to(roomId).emit('room:cardplay', { card })
+      }
+    })
+
+    // ===== 행운 성공 전환 결과 카드 — 서버가 정체성 스탬프 후 kind='luck' 로 공개 브로드캐스트(히스토리 저장). =====
+    on('chat:luck', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.command !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      if (room.luckEnabled === false) return // 하우스룰 OFF 면 행운 전환 무시(위조 방어)
+      const sender = room.participants.get(playerId)
+      if (!sender) return
+      const identity = room.characters.get(playerId)
+      const author = identity?.name || sender.nick
+      const color = identity?.color || sender.color
+      // 그룹 탭에서 전환하면 그 그룹에만 — 메인으로 돌려 방 전체에 뿌리면 굴림 원문이 비멤버에게 새어 나간다.
+      const groupId =
+        req.channel === 'group' && typeof req.groupId === 'string' && req.groupId ? req.groupId : ''
+      const inGroup = groupId ? store.canAccessChannel(roomId, groupId, playerId) : false
+      const channel: ChatChannel = inGroup ? 'group' : req.channel === 'ooc' ? 'ooc' : 'main'
+      const cost = Number.isFinite(req.cost) ? Math.max(0, Math.floor(req.cost)) : 0
+      const remaining = Number.isFinite(req.remaining) ? Math.max(0, Math.floor(req.remaining)) : 0
+      const message: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel,
+        kind: 'luck',
+        author,
+        playerId,
+        color,
+        avatar: presenceHeadshot(identity), // 발화 당시 두상 각인
+        nameColor: identity?.nameColor,
+        ...(inGroup ? { groupId } : {}),
+        luck: { cost, remaining, command: req.command.slice(0, 200) }
+      }
+      store.addMessage(roomId, message)
+      if (inGroup) {
+        const targets = store.channelRecipients(roomId, groupId).map((id) => 'user:' + id)
+        if (targets.length) io.to(targets).emit('chat:new', message)
+        return
+      }
+      io.to(roomId).emit('chat:new', message)
+    })
+
+    // ===== 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄. =====
+    // 행운 전환(chat:luck)과 같은 모양: 발신자 정체성은 서버가 스탬프(위조 방지), 값은 클라가 알려 준다.
+    on('chat:stat', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.label !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return // 방 밖 소켓 무시
+      const num = (v: unknown): number | null =>
+        typeof v === 'number' && Number.isFinite(v) ? Math.max(-1_000_000, Math.min(1_000_000, Math.floor(v))) : null
+      const from = num(req.from)
+      const to = num(req.to)
+      if (from === null || to === null || from === to) return // 변화가 없으면 남기지 않는다
+      const max = num(req.max)
+      // 라벨은 '이름 · 항목' 형태로 온다. 짧게 자르면 뒤에 붙은 '체력/정신력/이성'이 통째로 날아가
+      // 무슨 수치가 변한 건지 사라지므로, 이름이 긴 경우까지 담을 만큼 넉넉히 둔다.
+      const label = req.label.trim().slice(0, 60)
+      if (!label) return
+      // 굴림 유래 줄은 그 굴림과 같은 탭으로 — 그룹(비밀 HO) 탭에서 굴렸으면 차감 안내도 그 탭에만.
+      // 그룹은 발신 권한을 검증하고, 통과 못 하면 예전대로 메인에 남긴다(안내가 통째로 사라지는 것 방지).
+      const groupId =
+        req.channel === 'group' &&
+        typeof req.groupId === 'string' &&
+        req.groupId &&
+        store.canAccessChannel(roomId, req.groupId, playerId)
+          ? req.groupId
+          : undefined
+      const channel = req.channel === 'ooc' ? 'ooc' : groupId ? 'group' : 'main'
+      const identity = speakerFor(roomId, req.charId)
+      const diff = to - from
+      const message: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel,
+        ...(groupId ? { groupId } : {}),
+        kind: 'stat',
+        author: identity?.name || sender.nick,
+        playerId,
+        ...(identity?.charId ? { charId: identity.charId } : {}),
+        color: identity?.color || sender.color,
+        avatar: presenceHeadshot(identity) ?? '', // '' = 인장 없음 확정(소급 재해석 방지)
+        nameColor: identity?.nameColor,
+        stat: { label, from, to, max: max !== null && max > 0 ? max : undefined },
+        // GM 이 남기는 상태 변화는 기본 GM 에게만 보인다 — GM 이 든 NPC·적 시트의 체력이 방 전체에
+        // 실시간으로 새어 나가면 진행이 무너진다. 다만 '공개 굴림에서 유래한' 줄(open)은 판정 카드가
+        // 이미 손실량까지 공개했으므로 함께 공개한다. 발신자가 비밀 굴림 중이면(secret) 누구든 비밀로.
+        secret: (req.secret === true || (sender.role === 'GM' && req.open !== true)) || undefined,
+        // 이 종류를 모르는 구버전 프로그램에서도 읽히게 평문을 함께 싣는다(빈 줄로 뜨는 것 방지).
+        // 덤으로 채팅 검색에도 걸린다(검색은 text 만 본다).
+        text: `${label} ${from} → ${to} (${diff > 0 ? '+' : ''}${diff})`
+      }
+      store.addMessage(roomId, message)
+      // 비밀·그룹이면 당사자·GM·멤버 개인 룸으로만(히스토리 필터 canSeeMessage 와 같은 집합).
+      for (const target of messageAudience(room, message)) io.to(target).emit('chat:new', message)
+    })
+
+    // ===== GM 선택지 게시 — 옵션 스크립트는 서버만 보관(비공개), 라벨만 방 전체에 브로드캐스트(히스토리 저장). =====
+    on('chat:choice', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.prompt !== 'string') return
+      const opts = Array.isArray(req.options) ? req.options : []
+      const stored = opts
+        .filter((o) => o && typeof o.label === 'string' && o.label.trim())
+        .slice(0, 10)
+        .map((o, i) => ({
+          id: typeof o.id === 'string' && o.id ? o.id : `o${i}`,
+          label: o.label.slice(0, 200),
+          script: typeof o.script === 'string' && o.script ? o.script.slice(0, 4000) : undefined
+        }))
+      if (!stored.length) return
+      const id = randomUUID()
+      store.setChoice(roomId, id, stored) // 스크립트 포함 서버 보관
+      const pub = stored.map((o) => ({ id: o.id, label: o.label })) // 브로드캐스트본은 스크립트 제거
+      // 선택지 색 — hex 만 통과(비밀 아님 → 메시지에 실어 영속). 없으면 테마 기본.
+      const hex = (c: unknown): string | undefined =>
+        typeof c === 'string' && /^#[0-9a-f]{3,8}$/i.test(c.trim()) ? c.trim() : undefined
+      const message: ChatMessage = {
+        id,
+        time: Date.now(),
+        channel: 'main',
+        kind: 'choice',
+        playerId,
+        choice: {
+          prompt: req.prompt.slice(0, 500),
+          options: pub,
+          btnColor: hex(req.btnColor),
+          bgColor: hex(req.bgColor),
+          textColor: hex(req.textColor),
+          promptColor: hex(req.promptColor)
+        }
+      }
+      store.addMessage(roomId, message)
+      io.to(roomId).emit('chat:new', message)
+    })
+
+    // ===== 플레이어 선택지 응답 — 1회만. GM 비공개 통지 +(스크립트 있으면)본인 출력 + 본인 버튼 잠금. =====
+    on('choice:select', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.messageId !== 'string' || typeof req.optionId !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return
+      const res = store.selectChoice(roomId, req.messageId, req.optionId, playerId)
+      if (!res) {
+        // 중복 응답·무효 옵션·서버가 모르는 선택지. 조용히 끝내면 '눌러도 아무 일이 없다'로만
+        // 보인다 — 왜 안 되는지 누른 사람에게 알린다(히스토리에는 남기지 않는 일회성 안내).
+        io.to('user:' + playerId).emit('chat:new', {
+          id: randomUUID(),
+          time: Date.now(),
+          channel: 'main',
+          kind: 'system',
+          text: '이미 선택했거나, 서버가 더는 들고 있지 않은 선택지입니다.'
+        } satisfies ChatMessage)
+        return
+      }
+      const { option } = res
+      const name = room.characters.get(playerId)?.name || sender.nick
+      // GM 비공개 통지("○○님이 [라벨] 선택").
+      // secret=true + playerId → 고른 본인과 GM 에게만 보인다(canSeeMessage). 히스토리에 저장해야
+      // GM 이 그 순간 접속 중이 아니었거나 새로고침해도 남는다 — '비공개 결과 수집'의 알맹이다.
+      const notice: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel: 'main',
+        kind: 'system',
+        playerId,
+        secret: true,
+        text: `${name}님이 「${option.label}」 선택`
+      }
+      store.addMessage(roomId, notice)
+      // GM 이 여럿일 수 있다 — 비밀 메시지 열람 규칙(canSeeMessage)과 같은 집합에 보낸다.
+      // 한 명만 집으면 나머지 GM 은 그 자리에서 못 보고 다시 들어와야 보인다.
+      const gmIds = [...room.participants.values()]
+        .filter((p) => p.role === 'GM' && p.playerId !== playerId)
+        .map((p) => p.playerId)
+      for (const gid of gmIds) io.to('user:' + gid).emit('chat:new', notice)
+      io.to('user:' + playerId).emit('chat:new', notice)
+      // 스크립트가 있으면 선택한 본인에게만 꾸미기 스크립트로 출력(GM 은 secret 열람 권한으로 함께 본다).
+      if (option.script) {
+        const scriptMsg: ChatMessage = {
+          id: randomUUID(),
+          time: Date.now(),
+          channel: 'main',
+          kind: 'script',
+          playerId,
+          secret: true,
+          text: option.script
+        }
+        store.addMessage(roomId, scriptMsg)
+        io.to('user:' + playerId).emit('chat:new', scriptMsg)
+        for (const gid of gmIds) io.to('user:' + gid).emit('chat:new', scriptMsg)
+      }
+      // 본인 버튼 잠금(고른 옵션 표시).
+      io.to('user:' + playerId).emit('choice:locked', { messageId: req.messageId, optionId: req.optionId })
+    })
+
+    // ===== 채팅 수정/삭제 — 수정=작성자 본인/GM(텍스트만), 삭제=GM 만. 서버가 권한 검증 후 방 전체에 반영. =====
+    on('chat:edit', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return // 방 밖 소켓 무시
+      const text = (typeof req.text === 'string' ? req.text : '').slice(0, MAX_CHAT_CHARS)
+      if (!text.trim()) return
+      const msg = store.editMessage(roomId, req.id, text, playerId, sender.role === 'GM')
+      // 귓속말·비밀 메시지 수정본은 원문과 같은 사람에게만 — 방 전체로 쏘면 본문이 통째로 새어 나간다.
+      if (msg) io.to(messageAudience(room, msg)).emit('chat:edited', { id: msg.id, text })
+    })
+
+    on('chat:delete', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return
+      // 지우기 전에 대상 집합을 뽑아 둔다(삭제 후엔 메시지가 사라져 라우팅을 복원할 수 없다).
+      const before = room.messages.find((m) => m.id === req.id)
+      const audience = before ? messageAudience(room, before) : [roomId]
+      const id = store.deleteMessage(roomId, req.id, sender.role === 'GM')
+      if (id) io.to(audience).emit('chat:deleted', { id })
+    })
+
+    // 보관된 지난 대화 되읽기 — 방이 메모리에 들고 있는 몫보다 앞선 대화.
+    // 열람권은 스토어가 거르고(귓속말·비밀·남의 그룹), 두상은 입장 스냅샷과 같이 풀로 분리해 자산 참조로 보낸다.
+    //
+    // 되읽기는 디스크를 읽는 무거운 일이라, 겹쳐 부르면 서버 전체가 그만큼 멈춘다.
+    // 앞선 요청이 끝나기 전에는 다음 요청을 받지 않는다(정상 사용은 응답을 받고 다음 장을 부른다).
+    // 사람 단위로 재야 창을 여러 개 띄워 겹쳐 부르는 길이 막히고, 서버 단위 상한이 나머지를 받친다.
+    on('chat:older', (req, ack) => {
+      if (olderBusyBy.has(playerId)) {
+        ack?.({ ok: false, error: '앞서 요청한 대화를 아직 불러오는 중입니다.' })
+        return
+      }
+      if (olderInFlight >= OLDER_INFLIGHT_MAX) {
+        ack?.({ ok: false, error: '지금 보관 대화를 읽는 사람이 많습니다. 잠시 뒤 다시 시도해 주세요.' })
+        return
+      }
+      olderBusyBy.add(playerId)
+      olderInFlight++
+      void (async () => {
+        try {
+          const roomId = socket.data.roomId
+          const room = roomId ? store.getRoom(roomId) : undefined
+          const viewer = room?.participants.get(playerId)
+          if (!roomId || !room || !viewer) {
+            ack?.({ ok: false, error: '세션에 들어가 있지 않습니다.' })
+            return
+          }
+          const c = req?.cursor
+          const cursor =
+            c && Number.isInteger(c.part) && c.part > 0 && Number.isInteger(c.line) && c.line >= -1
+              ? { part: c.part, line: c.line }
+              : null
+          const limit = Number.isFinite(req?.limit) ? Number(req?.limit) : 200
+          const got = store.archivedFor(roomId, { playerId, role: viewer.role }, cursor, limit)
+          if (!got) {
+            ack?.({ ok: false, error: '보관된 대화를 읽을 수 없습니다.' })
+            return
+          }
+          const pool = got.avatarPool.length ? await Promise.all(got.avatarPool.map(internalizeInlineImage)) : []
+          ack?.({ ok: true, data: { messages: got.messages, avatarPool: pool, cursor: got.cursor } })
+        } catch (e) {
+          // 응답 없이 끝나면 클라는 시간 초과로 8초를 기다린다 — 사유를 그대로 돌려준다.
+          console.error(`[relay] chat:older 실패(${playerId}):`, e)
+          ack?.({ ok: false, error: '보관된 대화를 읽지 못했습니다.' })
+        } finally {
+          olderBusyBy.delete(playerId)
+          olderInFlight--
+        }
+      })()
+    })
+
+    // ===== 입력 중 표시 (휘발 — 저장 안 함, 발신자 제외 방 전체) =====
+    on('chat:typing', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시
+      // 어느 탭에서 치는지 그대로 중계(클라가 활성 탭만 표시). channel 미지정이면 'main' 으로 폴백.
+      const channel =
+        req.channel === 'ooc' || req.channel === 'whisper' || req.channel === 'group' ? req.channel : 'main'
+      const groupId = channel === 'group' && typeof req.groupId === 'string' ? req.groupId : undefined
+      socket
+        .to(roomId)
+        .emit('chat:typing', {
+          playerId,
+          typing: req.typing === true,
+          channel,
+          ...(groupId ? { groupId } : {})
+        })
+    })
+
+    // ===== 캐릭터 프레즌스 공유 =====
+    // 스탠딩을 뺀 공통 필드 정규화 — char:update 와 char:identity 가 함께 쓴다.
+    // playerId 는 서버 권위 스탬프. 나머지는 신뢰 못 할 클라 페이로드라 방어적으로 훑는다.
+    const coerceIdentity = (req: CharIdentityReq): Omit<SharedCharacter, 'standings'> => {
+      const rawStats = req.stats
+      const stats =
+        rawStats && typeof rawStats === 'object'
+          ? {
+              hp: typeof rawStats.hp === 'number' ? rawStats.hp : 0,
+              hpMax: typeof rawStats.hpMax === 'number' ? rawStats.hpMax : 0,
+              mp: typeof rawStats.mp === 'number' ? rawStats.mp : 0,
+              mpMax: typeof rawStats.mpMax === 'number' ? rawStats.mpMax : 0,
+              san: typeof rawStats.san === 'number' ? rawStats.san : 0,
+              sanMax: typeof rawStats.sanMax === 'number' ? rawStats.sanMax : 0
+            }
+          : undefined
+      return {
+        playerId,
+        charId: typeof req.charId === 'string' ? req.charId : '',
+        name: typeof req.name === 'string' ? req.name : '',
+        color: typeof req.color === 'string' && req.color ? req.color : '#7c9cff',
+        nameColor: typeof req.nameColor === 'string' ? req.nameColor : undefined, // 이름색(F) 보존
+        headshot: typeof req.headshot === 'string' ? req.headshot : undefined,
+        // 표정별 두상 — 스탠딩과 index 연동. 빈 문자열(폴백 표시)도 보존.
+        headshots: Array.isArray(req.headshots)
+          ? req.headshots.filter((s) => typeof s === 'string')
+          : undefined,
+        currentExpression: typeof req.currentExpression === 'number' ? req.currentExpression : 0,
+        visibility: req.visibility === 'public' || req.visibility === 'hidden' ? req.visibility : 'private',
+        stats,
+        bio: typeof req.bio === 'string' ? req.bio.slice(0, 500) : undefined, // 계정 자기소개(프로필 팝업용)
+        banner: typeof req.banner === 'string' && req.banner ? req.banner.slice(0, 1_200_000) : undefined, // 프로필 배너
+        links: coerceProfileLinks(req.links), // 프로필 링크(SNS 바이오)
+        profileTheme: coerceProfileTheme(req.profileTheme), // 프로필 색 테마
+        // VN 무대 스탠딩 표시 높이(px) — 숫자만 통과(setCharacter 가 40~4000 클램프·비유한 드롭). 빠지면 멀티에서 크기 미동기화.
+        standingHeight: typeof req.standingHeight === 'number' ? req.standingHeight : undefined
+      }
+    }
+
+    on('char:update', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시 (위조 방지)
+      const stored = store.setCharacter(roomId, {
+        ...coerceIdentity(req),
+        standings: Array.isArray(req.standings) ? req.standings.filter((s) => typeof s === 'string') : [],
+        currentExpression: typeof req.currentExpression === 'number' ? req.currentExpression : 0
+      })
+      if (stored) io.to(roomId).emit('char:state', stored)
+    })
+
+    // 스탠딩 빼고 '누구로 말하는가'만 즉시 반영 — 스탠딩 업로드를 기다리는 사이에 친 말이
+    // 옛 캐릭터로 각인되는 것을 막는다. 보관 중인 스탠딩은 같은 캐릭터일 때만 유지(mergeIdentity).
+    on('char:identity', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시 (위조 방지)
+      const stored = store.mergeIdentity(roomId, coerceIdentity(req))
+      if (stored) io.to(roomId).emit('char:state', stored)
+    })
+
+    // 장착 슬롯은 그대로 두고 보관대(charPool)에만 담는다 — 분리 창이 제 화자를 등록하는 길.
+    // 장착(char:update)로 담으면 무대·로스터까지 그 캐릭터로 갈아타 창끼리 서로를 밀어낸다.
+    // 방송도 char:pool 로 — 수신 클라는 보관대만 갱신한다(chat:new 의 charId 동결이 이 사본을 본다).
+    on('char:pool', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시 (위조 방지)
+      const stored = store.poolCharacter(roomId, {
+        ...coerceIdentity(req),
+        standings: Array.isArray(req.standings) ? req.standings.filter((s) => typeof s === 'string') : [],
+        currentExpression: typeof req.currentExpression === 'number' ? req.currentExpression : 0
+      })
+      if (stored) io.to(roomId).emit('char:pool', stored)
+    })
+
+    on('char:expr', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.index !== 'number') return
+      const index = store.setExpression(roomId, playerId, req.index)
+      if (index !== undefined) io.to(roomId).emit('char:expr', { playerId, index })
+    })
+
+    // ===== 추방 (GM 전용) =====
+    on('room:kick', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.playerId !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // GM 만 추방 가능
+      const target = req.playerId
+      if (target === playerId) return // 자기 자신 추방 불가
+      const targetP = room.participants.get(target)
+      if (!targetP) return
+      if (target === room.ownerId) return // 방을 만든 사람은 추방 불가
+      // GM 끼리는 서로 자르지 못한다 — 방을 만든 사람만 공동 GM 을 내보낼 수 있고, 그때 자격도 함께 거둔다
+      // (남겨 두면 초대 코드로 다시 들어오는 순간 GM 으로 돌아온다).
+      if (targetP.role === 'GM') {
+        if (playerId !== room.ownerId) return
+        room.gmIds.delete(target)
+      }
+      // 참가자·캐릭터 제거(GM 잔류로 방은 유지) + 초대 코드 재발급(옛 코드 무효화)
+      store.leave(roomId, target)
+      // 멤버십도 제거 — 안 지우면 추방당한 계정이 '내 세션 목록'에서 room:enter(members.has 통과)로 재입장 가능(코드 재발급 무력화).
+      room.members.delete(target)
+      // 휘발 위치·뷰맵에서 추방 대상 제거(room:leave 와 동일 — 죽은 항목 잔류 방지). GM 잔류로 방은 유지.
+      roomPositions.get(roomId)?.delete(target)
+      roomViews.get(roomId)?.delete(target)
+      const newCode = store.reissueCode(roomId)
+      // 추방 대상: 통지 후 방 소켓룸에서 제외(이후 공개 메시지 차단)
+      io.to('user:' + target).emit('room:closed', '방에서 추방되었습니다.')
+      void io.in('user:' + target).socketsLeave(roomId)
+      // 추방 대상 소켓의 현재 방 표식도 정리 — 남겨두면 그 소켓이 다음에 다른 방에 들어갈 때
+      // 입장 핸들러의 '이전 방 자동 퇴장'이 이 stale 값으로 이 방을 건드린다(재초대된 참가자 오삭제 등).
+      for (const s of io.sockets.sockets.values()) {
+        if (s.data.playerId === target && s.data.roomId === roomId) s.data.roomId = undefined
+      }
+      syncPresence(target) // '세션중' 표시 해제(계정 id=playerId 운영 전제 — inSession 이 store 재검증)
+      // 갱신은 방 전체, 새 코드는 "남은 참가자 개인 룸"에만(추방 대상은 participants 에서 빠져 새 코드 수신 불가 = 재입장 차단).
+      // 공동 GM 을 내보냈다면 명단도 함께 알린다 — 화면의 GM 표시가 남아 있지 않게.
+      io.to(roomId).emit('room:gm', { ownerId: room.ownerId, gmIds: [...room.gmIds] })
+      broadcastParticipants(roomId)
+      const remaining = store.getRoom(roomId)
+      if (newCode && remaining) {
+        for (const pid of remaining.participants.keys()) io.to('user:' + pid).emit('room:code', newCode)
+      }
+    })
+
+    // ===== 외형: 방 GM(소유자)의 테마·다이스 카드 강제 =====
+    on('room:appearance', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // 방 GM 만 외형 강제(자기 방에 한함)
+      const ap = store.setAppearance(roomId, req)
+      if (ap) io.to(roomId).emit('room:appearance', ap) // 방 전체(GM 포함) 동기화
+    })
+
+    // ===== 캐릭터 시트 영속 (인증 계정 전용) =====
+    // 저장/삭제는 본인 계정에만. 변경 시 그 계정의 모든 소켓(다기기)에 최신 라이브러리 동기화.
+    on('char:save', (req) => {
+      const acct = socket.data.account
+      if (!acct || !req || typeof req.id !== 'string' || !req.id) return
+      // 발신 소켓은 제외(socket.to) — 저장한 본인은 이미 로컬에 최신 상태가 있고, 자기 에코로 전체 라이브러리를
+      // 되받으면 편집 중 시트를 옛 스냅샷으로 덮을 수 있다. 같은 계정의 '다른 기기'에는 그대로 동기화된다.
+      if (characters.save(acct.id, req))
+        socket.to('acct:' + acct.id).emit('char:library', characters.list(acct.id))
+    })
+
+    on('char:delete', (req) => {
+      const acct = socket.data.account
+      if (!acct || !req || typeof req.id !== 'string') return
+      if (characters.remove(acct.id, req.id))
+        socket.to('acct:' + acct.id).emit('char:library', characters.list(acct.id))
+    })
+
+    // ===== 방별 시트 멤버십 — 내 라이브러리 시트를 이 방에 추가/제거(서버 영속). =====
+    on('room:char:add', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.charId !== 'string' || !req.charId) return
+      const ids = store.addRoomChar(roomId, playerId, req.charId.slice(0, 200))
+      if (ids) io.to('user:' + playerId).emit('room:char:list', { playerId, charIds: ids })
+    })
+    on('room:char:remove', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.charId !== 'string') return
+      const ids = store.removeRoomChar(roomId, playerId, req.charId)
+      if (ids) io.to('user:' + playerId).emit('room:char:list', { playerId, charIds: ids })
+    })
+
+    // ===== GM 시트 지급 — GM 이 만든 시트를 대상 플레이어 계정으로 복사 + 그 방 멤버십에 추가. =====
+    on('room:char:grant', (req) => {
+      const roomId = socket.data.roomId
+      if (
+        !roomId ||
+        !req ||
+        typeof req.targetPlayerId !== 'string' ||
+        !req.record ||
+        typeof req.record !== 'object'
+      )
+        return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // GM 만 지급
+      const target = req.targetPlayerId
+      if (!room.participants.has(target)) return // 같은 방 참가자만
+      const newId = randomUUID()
+      const record = { ...(req.record as Record<string, unknown>), id: newId } // 새 id 로 소유권 이전 복사
+      if (!characters.save(target, record)) return
+      store.addRoomChar(roomId, target, newId)
+      io.to('acct:' + target).emit('char:library', characters.list(target)) // 대상 라이브러리 갱신
+      io.to('user:' + target).emit('room:char:list', {
+        playerId: target,
+        charIds: store.roomCharsFor(roomId, target)
+      })
+      // 대상에게만 받음 알림(시스템 메시지 · 히스토리 미저장).
+      const sys = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel: 'main' as const,
+        kind: 'system' as const,
+        text: 'GM이 캐릭터 시트를 지급했습니다.'
+      }
+      io.to('user:' + target).emit('chat:new', sys)
+    })
+
+    // GM 시트 지급 취소·빼앗기 — 대상의 계정·방에서 해당 시트 회수(삭제).
+    on('room:char:revoke', (req) => {
+      const roomId = socket.data.roomId
+      if (
+        !roomId ||
+        !req ||
+        typeof req.targetPlayerId !== 'string' ||
+        typeof req.charId !== 'string' ||
+        !req.charId
+      )
+        return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // GM 만 회수
+      const target = req.targetPlayerId
+      // 같은 방 참가자 또는 세션 멤버 — 부재 멤버 시트도 열람이 열려 있으므로 회수도 같은 경계로(무음 무시 방지).
+      if (!room.participants.has(target) && !room.members.has(target)) return
+      // 삭제가 아니라 GM 라이브러리로 회수(이전). 대상 레코드를 GM 계정으로 복사 + GM 방 멤버십에 추가.
+      const gmAcct = socket.data.account
+      if (gmAcct) {
+        const record = characters.get(target, req.charId)
+        if (record) {
+          characters.save(gmAcct.id, record) // 같은 id 유지(소유권을 GM 으로 이전)
+          store.addRoomChar(roomId, gmAcct.id, req.charId)
+          io.to('acct:' + gmAcct.id).emit('char:library', characters.list(gmAcct.id)) // GM 라이브러리에 추가 반영
+          io.to('user:' + gmAcct.id).emit('room:char:list', {
+            playerId: gmAcct.id,
+            charIds: store.roomCharsFor(roomId, gmAcct.id)
+          })
+        }
+      }
+      // 대상 계정/방에서 제거(권한 회수).
+      store.removeRoomChar(roomId, target, req.charId)
+      characters.remove(target, req.charId)
+      io.to('acct:' + target).emit('char:library', characters.list(target)) // 대상 라이브러리 갱신(계정 기준 — 어디 있든 안전)
+      // 방 기준 푸시(시트 멤버십·통지)는 이 방에 재실 중일 때만 — 부재 대상이 '다른 방'에 온라인이면
+      // 이 방 기준 목록/통지가 그 방 화면을 오염시킨다. 부재자는 다음 입장 스냅샷이 올바른 목록을 준다.
+      if (room.participants.has(target)) {
+        io.to('user:' + target).emit('room:char:list', {
+          playerId: target,
+          charIds: store.roomCharsFor(roomId, target)
+        })
+        // 회수 통지(대상에게).
+        const sys = {
+          id: randomUUID(),
+          time: Date.now(),
+          channel: 'main' as const,
+          kind: 'system' as const,
+          text: 'GM이 캐릭터 시트를 회수했습니다.'
+        }
+        io.to('user:' + target).emit('chat:new', sys)
+      }
+      // 요청 GM 의 열람 데이터 갱신(대상 전체 시트).
+      socket.emit('sheet:data', { playerId: target, characters: characters.list(target) })
+    })
+
+    // ===== GM 전용 시트 열람 =====
+    // 같은 방 GM 이 참가자의 전체 캐릭터 시트를 읽기전용으로 요청. 인증 참가자는 playerId === account.id 이므로
+    // 그 id 로 캐릭터 라이브러리를 조회해 "요청한 GM 소켓에게만" 전달(상시 전송 아님 · 온디맨드).
+    on('sheet:request', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.playerId !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // GM 만 열람 가능
+      const target = req.playerId
+      // 같은 방 참가자 또는 세션 멤버(입장 이력 계정) — 부재 PL 의 시트도 스탠딩 배치용으로 열람 가능.
+      if (!room.participants.has(target) && !room.members.has(target)) return
+      // GM 은 대상 참가자의 전체 캐릭터 시트를 열람(방 멤버십 필터 없음 — 직접 만들어 방에 안 넣은 시트도 포함).
+      socket.emit('sheet:data', { playerId: target, characters: characters.list(target) })
+    })
+
+    // ===== 부재 멤버 목록 (GM 전용) =====
+    // 이 세션에 입장한 적 있으나 지금은 나가 있는 계정 — 스탠딩 배치 메뉴에서 부재 PL 시트를 고르는 용도.
+    on('room:absentMembers', (ack) => {
+      const roomId = socket.data.roomId
+      const room = roomId ? store.getRoom(roomId) : undefined
+      const me = room?.participants.get(playerId)
+      if (!room || !me || me.role !== 'GM') {
+        ack?.({ ok: false, error: 'GM만 조회할 수 있습니다.' })
+        return
+      }
+      const list = [...room.members]
+        .filter((id) => !room.participants.has(id))
+        .map((id) => ({ playerId: id, nick: displayNick(id) || '(탈퇴한 계정)' }))
+      ack?.({ ok: true, data: list })
+    })
+
+    // ===== GM 전용 시트 편집 =====
+    // GM 이 같은 방 참가자의 시트를 수정 → 대상 계정에 저장 + 대상 본인에게 sheet:push(로컬 병합) + GM 열람 데이터 갱신.
+    on('sheet:edit', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.targetPlayerId !== 'string') return
+      const char = req.character
+      if (!char || typeof char.id !== 'string' || !char.id) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // GM 만 편집
+      const target = req.targetPlayerId
+      // 같은 방 참가자 또는 세션 멤버 — 부재 멤버 시트도 열람이 열려 있으므로 편집이 무음 유실되지 않게 같은 경계로.
+      if (!room.participants.has(target) && !room.members.has(target)) return
+      // 대상 계정에 저장(덮어쓰기) — 오프라인이어도 영속(재접속 시 char:library 로 반영).
+      const saved = characters.save(target, char)
+      if (!saved) return
+      // 대상 본인에게 푸시(자기 로컬 캐릭터 병합) + GM 열람 데이터 갱신(전체 시트).
+      io.to('user:' + target).emit('sheet:push', { character: saved })
+      socket.emit('sheet:data', { playerId: target, characters: characters.list(target) })
+    })
+
+    // ===== 핸드아웃 (GM 전용) =====
+    on('handout:upsert', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // 생성/편집은 GM 만
+      const res = store.upsertHandout(roomId, req)
+      if (!res) return
+      const { handout, prev } = res
+      const all = [...room.participants.values()]
+      const newView = all.filter((p) => canViewHandout(handout, p)).map((p) => p.playerId)
+      // 가시성이 좁아졌으면(이전엔 보였으나 지금은 못 봄) 그 대상에서 제거(잔여 사본 정리).
+      if (prev) {
+        const lost = all
+          .filter((p) => canViewHandout(prev, p) && !canViewHandout(handout, p))
+          .map((p) => p.playerId)
+        emitHandoutRemove(lost, handout.id)
+      }
+      emitHandoutState(newView, handout)
+    })
+
+    on('handout:delete', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return
+      const prev = store.deleteHandout(roomId, req.id)
+      if (!prev) return
+      const targets = [...room.participants.values()]
+        .filter((p) => canViewHandout(prev, p))
+        .map((p) => p.playerId)
+      emitHandoutRemove(targets, prev.id)
+    })
+
+    on('handout:focus', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return
+      const h = store.getHandout(roomId, req.id)
+      if (!h || h.scope === 'private') return // 비공개엔 강제 포커스 미동작
+      // 대상 = 볼 수 있는 사람 중 발신 GM 제외(GM 본인 화면은 강제 오픈 안 함).
+      const targets = [...room.participants.values()]
+        .filter((p) => p.playerId !== playerId && canViewHandout(h, p))
+        .map((p) => p.playerId)
+      emitHandoutFocus(targets, h.id)
+    })
+
+    on('handout:reorder', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // 재배치도 upsert 와 같은 GM 전용
+      const changed = store.reorderHandout(
+        roomId,
+        req.id,
+        typeof req.beforeId === 'string' ? req.beforeId : undefined
+      )
+      if (!changed) return
+      // 순서만 바뀌었으니 가시성 diff 는 없다 — 바뀐 각 건을 볼 수 있는 사람에게 그대로 재방송.
+      const all = [...room.participants.values()]
+      for (const h of changed) {
+        const view = all.filter((p) => canViewHandout(h, p)).map((p) => p.playerId)
+        emitHandoutState(view, h)
+      }
+    })
+
+    // ===== 맵·토큰 (다중 맵) =====
+    // GM 검증: 방에 속한 GM 이면 roomId, 아니면 undefined.
+    const gmRoomId = (): string | undefined => {
+      const roomId = socket.data.roomId
+      if (!roomId) return undefined
+      const me = store.getRoom(roomId)?.participants.get(playerId)
+      return me && me.role === 'GM' ? roomId : undefined
+    }
+
+    // 토큰 공개범위(visibility)에 따라 '볼 수 있는 참가자'에게만 방송하기 위한 헬퍼(기존 개인 룸 user:<id> 재사용).
+    // 못 보는 참가자에겐 서버가 아예 전송하지 않는다(클라 은닉 신뢰 X).
+    /** token:state 방송 — 참가자별로 앞면/뒷면 표현을 보내고, 아무 면도 못 보면 token:remove(가진 경우 드롭). */
+    const broadcastTokenState = (room: Room, roomId: string, mapId: string, token: Token): void => {
+      // 전체 공개 + 상태 비공개 상태바 없음 → 원본을 방 전체에(그 외엔 참가자별 표현).
+      if (tokenVisibility(token) === 'all' && !(token.statsPrivate && token.bars?.length)) {
+        io.to(roomId).emit('token:state', { mapId, token })
+        return
+      }
+      for (const p of room.participants.values()) {
+        const ur = 'user:' + p.playerId
+        const rep = tokenForViewer(token, p) // 앞면 / 뒷면 / null(미표시)
+        if (rep) io.to(ur).emit('token:state', { mapId, token: rep })
+        else io.to(ur).emit('token:remove', { mapId, id: token.id })
+      }
+    }
+    /**
+     * move/rotate/imageindex 등 경량 이벤트 — 해당 면을 보유한 참가자에게만.
+     * needFront=true 면 앞면 보유자만(이미지 카드 전환), false 면 앞·뒷면 어느 쪽이든 보유자(위치·각도).
+     */
+    const emitToTokenViewers = (
+      room: Room,
+      roomId: string,
+      token: Token,
+      needFront: boolean,
+      send: (target: string | string[]) => void
+    ): void => {
+      if (tokenVisibility(token) === 'all') {
+        send(roomId)
+        return
+      }
+      const rooms = [...room.participants.values()]
+        .filter((p) => (needFront ? canSeeToken(token, p) : tokenForViewer(token, p) !== null))
+        .map((p) => 'user:' + p.playerId)
+      if (rooms.length) send(rooms)
+    }
+    /** map:added 방송 — 제한/양면 토큰이 있으면 참가자별로 앞면/뒷면 표현만 담아 개별 전송. */
+    const broadcastMapAdded = (room: Room, roomId: string, map: GameMap): void => {
+      if (map.tokens.every((t) => tokenVisibility(t) === 'all' && !(t.statsPrivate && t.bars?.length))) {
+        io.to(roomId).emit('map:added', map)
+        return
+      }
+      for (const p of room.participants.values())
+        io.to('user:' + p.playerId).emit('map:added', {
+          ...map,
+          tokens: map.tokens.map((t) => tokenForViewer(t, p)).filter((t): t is Token => t !== null)
+        })
+    }
+    /**
+     * 통합 레이어 토큰 방송 — 가시성 제한이 없으면 방 전체로, 있으면 참가자별 표현으로.
+     * 맵 생성·복제·가져오기가 공유한다. 서버에서 mapIds 를 손봐 놓고 이걸 안 부르면 화면은 그대로다.
+     */
+    const emitGlobalTokens = (room: Room, roomId: string, tokens: Token[]): void => {
+      for (const t of tokens) {
+        if (tokenVisibility(t) === 'all' && !(t.statsPrivate && t.bars?.length)) {
+          io.to(roomId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: t })
+        } else {
+          for (const p of room.participants.values()) {
+            const rep = tokenForViewer(t, p)
+            if (rep) io.to('user:' + p.playerId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: rep })
+          }
+        }
+      }
+    }
+
+    // ===== BGM (다중 동시재생, GM 전용·전원 동기화) =====
+    // set=트랙 추가/로드(소스 포함 broadcast 전체 목록), control=경량 트랙 토글(재생/반복/볼륨), clear=한 트랙 또는 전체 정지.
+    on('bgm:set', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      // 음원은 /asset 업로드 후 'asset:' 참조로 와야 한다. 거대 인라인 data URL(클라 업로드 실패 폴백)이
+      // 방 상태에 박히면 bgm:state 로 전원에게 통째 재전송되므로, 저장 전에 떨군다(+진단 로그).
+      if (isOversizedInline(req.src)) {
+        log('drop', 'bgm:set oversized inline', playerId.slice(0, 8), 'chars', String(req.src).length)
+        return
+      }
+      const tracks = store.setBgm(roomId, req)
+      if (tracks) io.to(roomId).emit('bgm:state', tracks, roomId) // roomId=수신 클라의 자기 방 검증용
+    })
+
+    on('bgm:control', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const ctl = store.controlBgm(roomId, req)
+      if (ctl) io.to(roomId).emit('bgm:control', ctl, roomId)
+    })
+
+    on('bgm:clear', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      const tracks = store.clearBgm(roomId, typeof req?.trackId === 'string' ? req.trackId : undefined)
+      if (tracks) io.to(roomId).emit('bgm:state', tracks, roomId)
+    })
+
+    // 전체 트랙 권위적 교체 — '나만 듣기'→'전체 동기화' 재조정 시 GM 로컬과 방을 정확히 일치시켜 PL 혼선 제거.
+    on('bgm:replace', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      // bgm:set 과 동일 — 거대 인라인 음원 트랙은 제외하고 교체(참조·유튜브·작은 인라인만 통과).
+      const incoming = Array.isArray(req?.tracks) ? req.tracks : []
+      const safe = incoming.filter((t) => !isOversizedInline((t as { src?: unknown })?.src))
+      if (safe.length !== incoming.length) {
+        log(
+          'drop',
+          'bgm:replace oversized inline',
+          playerId.slice(0, 8),
+          'removed',
+          incoming.length - safe.length
+        )
+      }
+      const tracks = store.replaceBgm(roomId, safe)
+      if (tracks) io.to(roomId).emit('bgm:state', tracks, roomId)
+    })
+
+    // BGM 시크 — GM 이 재생 위치(초)를 전원에게 점프 명령. 위치는 항상 변하므로 저장 안 함(transient broadcast, 핑처럼).
+    // 존재하는 트랙에만, 위치는 유한·음수 차단. 전원(GM 에코 포함)이 받아 각자 오디오를 그 지점으로 이동.
+    on('bgm:seek', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || typeof req?.trackId !== 'string') return
+      const position =
+        typeof req.position === 'number' && Number.isFinite(req.position) ? Math.max(0, req.position) : 0
+      if (!store.getRoom(roomId)?.bgm.some((t) => t.trackId === req.trackId)) return // 없는 트랙 무시
+      io.to(roomId).emit('bgm:seek', { trackId: req.trackId, position }, roomId)
+    })
+
+    // 방 주사위 연출 카드(GM 전용). image 없으면 해제. level=성공 단계별, 없으면 공통 → 전원 동기화.
+    on('room:cutin', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setCutIn(roomId, typeof req.image === 'string' ? req.image : undefined, req.level)
+      if (res.ok) io.to(roomId).emit('room:cutin', { image: res.image, level: res.level })
+    })
+
+    // 화면 강제 이동(GM 전용) — 맵/비주얼노벨 탭 + (있으면)지정 맵으로 전환(휘발 액션, 방 상태 비저장).
+    // targets 지정 시 그 플레이어들만(개인 룸), 없으면 방 전원(특정 인원 이동).
+    on('room:view', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const view = req.view === 'vn' ? 'vn' : 'map'
+      const mapId = typeof req.mapId === 'string' ? req.mapId : undefined // 클라가 존재 여부 가드(setActiveLocal)
+      const targets = Array.isArray(req.targets)
+        ? req.targets.filter((t): t is string => typeof t === 'string' && !!t)
+        : undefined
+      if (targets && targets.length) io.to(targets.map((t) => 'user:' + t)).emit('room:view', { view, mapId })
+      else io.to(roomId).emit('room:view', { view, mapId })
+      // 전원 이동은 방의 활성 맵으로 기록 — 재입장자가 '마지막으로 있던 맵'에 착지하는 폴백 기준.
+      // 비주얼 노벨로 보낼 때도 장면(맵)은 같이 바뀌므로 함께 기록한다(안 하면 재입장자만 옛 장면에 착지).
+      if (mapId && !(targets && targets.length)) store.setActiveMap(roomId, mapId)
+    })
+
+    // 각 클라가 현재 보는 맵/뷰를 보고 — 서버는 위치를 저장하고 GM 들에게 집계(room:positions) 전달.
+    on('room:where', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || !req.mapId) return
+      if (!store.getRoom(roomId)?.participants.has(playerId)) return
+      let pos = roomPositions.get(roomId)
+      if (!pos) {
+        pos = new Map()
+        roomPositions.set(roomId, pos)
+      }
+      pos.set(playerId, req.mapId)
+      let vws = roomViews.get(roomId)
+      if (!vws) {
+        vws = new Map()
+        roomViews.set(roomId, vws)
+      }
+      vws.set(playerId, req.view === 'vn' ? 'vn' : 'map')
+      emitPositions(roomId)
+    })
+
+    // ~문장~ 행동지문 색(GM 전용) — 빈/무효값이면 해제. 방 단위 저장 + 전원 동기화.
+    on('room:dim', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setDimColor(roomId, typeof req.color === 'string' ? req.color : undefined)
+      if (res.ok) io.to(roomId).emit('room:dim', { color: res.color })
+    })
+
+    // 행운 깎기(CoC7 하우스룰) 사용 여부(GM 전용) — 전원 동기화.
+    on('room:luck', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setLuckEnabled(roomId, req.enabled === true)
+      if (res.ok) io.to(roomId).emit('room:luck', { enabled: res.enabled })
+    })
+
+    // 입실 잠금(공사중 · GM 전용) — 전원 동기화. 이미 들어와 있는 사람은 그대로 둔다.
+    on('room:lock', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setLocked(roomId, req.locked === true)
+      if (res.ok) io.to(roomId).emit('room:lock', { locked: res.locked })
+    })
+
+    // 일반 맵 VN 오버레이 표시(GM 전용) — 전원 동기화.
+    on('room:vnoverlay', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setVnOverlay(roomId, req.enabled === true)
+      if (res.ok) io.to(roomId).emit('room:vnoverlay', { enabled: res.enabled })
+    })
+
+    // 참가자 오브젝트 추가 허용(GM 전용) — 전원 동기화. 켜면 참가자도 token:place:pl 로 배치할 수 있다.
+    on('room:plobjects', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setPlObjects(roomId, req.enabled === true)
+      if (res.ok) io.to(roomId).emit('room:plobjects', { enabled: res.enabled })
+    })
+
+    // GM 귓속말 열람(GM 전용) — 전원 동기화. 참가자 모두에게 알리는 것은 숨기지 않기 위해서다.
+    // PL 은 이 값을 받아 귓속말 입력칸에 '지금은 GM 도 봅니다'를 띄운다.
+    on('room:gmwhisper', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setGmSeeWhispers(roomId, req.enabled === true)
+      if (res.ok) io.to(roomId).emit('room:gmwhisper', { enabled: res.enabled })
+    })
+
+    // GM 커스텀 광기표(GM 전용) — 서버 정규화 후 전원 동기화. 빈/무효면 기본표로 복귀.
+    on('room:madness', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setMadnessTables(roomId, req)
+      if (res.ok)
+        io.to(roomId).emit('room:madness', {
+          realtimeTemp: res.tables?.realtimeTemp ?? [],
+          realtimeIndef: res.tables?.realtimeIndef ?? [],
+          summary: res.tables?.summary ?? []
+        })
+    })
+
+    // GM 커스텀 인세인 표(GM 전용) — 서버 정규화 후 전원 동기화. 빈/무효면 해당 표만 기본표로 복귀.
+    on('room:insaneTables', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setInsaneTables(roomId, req)
+      if (res.ok) io.to(roomId).emit('room:insaneTables', res.tables ?? {})
+    })
+
+    // ===== 전투 (GM 전용·전원 동기화) =====
+    // 전체 상태 교체(시작·이니셔티브·턴진행·HP·종료=null). 서버가 GM 검증·정규화 후 전원에 combat:state.
+    on('combat:set', (state) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      const next = store.setCombat(roomId, state)
+      if (next !== undefined) io.to(roomId).emit('combat:state', next)
+    })
+
+    // ===== 그룹 채널 (GM 전용) =====
+    // 개설/삭제 후 각 참가자에게 본인이 볼 수 있는 채널 목록만 동기화(멤버 필터).
+    const syncChannels = (roomId: string): void => {
+      const room = store.getRoom(roomId)
+      if (!room) return
+      for (const p of room.participants.values()) {
+        io.to('user:' + p.playerId).emit('channel:list', store.channelsFor(room, p))
+      }
+    }
+    on('channel:create', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      if (store.createChannel(roomId, req)) syncChannels(roomId)
+    })
+    on('channel:remove', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req?.id) return
+      if (store.removeChannel(roomId, req.id)) syncChannels(roomId)
+    })
+
+    // ===== 방 불러오기 (GM 전용) =====
+    // 스냅샷 장면 적용 후, 참가자별 필터 스냅샷으로 전원 풀 재싱크(핸드아웃 가시성 보존).
+    on('room:load', async (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !store.loadSnapshot(roomId, req)) return
+      for (const p of room.participants.values()) {
+        io.to('user:' + p.playerId).emit('room:sync', await lightenAvatarPool(store.snapshot(room, p)))
+      }
+    })
+
+    on('map:create', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      const res = store.createMap(
+        roomId,
+        typeof req?.name === 'string' ? req.name : undefined,
+        typeof req?.baseMapId === 'string' ? req.baseMapId : undefined
+      )
+      const room = store.getRoom(roomId)
+      if (!res || !room) return
+      io.to(roomId).emit('map:added', res.map)
+      // 새 맵에 이어붙은 통합 레이어를 실제로 내려보낸다 — 이게 없으면 서버만 고쳐지고 화면은 그대로다
+      // (복제 맵이 정확히 그 자리다: 안 보내면 다시 들어와야 보인다).
+      emitGlobalTokens(room, roomId, res.touchedGlobals)
+    })
+
+    // 맵세트 복제(GM 전용) — 서버가 새 맵을 만들어 전원에 map:added.
+    on('map:duplicate', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.duplicateMap(roomId, req.mapId)
+      const room = store.getRoom(roomId)
+      if (!res || !room) return
+      broadcastMapAdded(room, roomId, res.map)
+      emitGlobalTokens(room, roomId, res.touchedGlobals)
+    })
+
+    // 맵세트 일괄 가져오기(GM 전용) — 외부 파일 변환 맵들을 정규화·생성해 각각 map:added.
+    on('map:import', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      // 배경/바탕/VN 배경은 'asset:' 참조여야 함 — 형제 map:background·map:vnbg 와 동일하게
+      // 거대 인라인(자산 업로드 실패 폴백)을 떨궈 스냅샷·방송 부풀림을 막는다.
+      const maps = Array.isArray(req.maps)
+        ? req.maps.map((m) => {
+            if (!m || typeof m !== 'object') return m
+            const o = m as unknown as Record<string, unknown>
+            const bg = o.background as { image?: unknown } | null | undefined
+            if (bg && isOversizedInline(bg.image)) o.background = null
+            const bd = o.backdrop as { image?: unknown } | null | undefined
+            if (bd && isOversizedInline(bd.image)) o.backdrop = undefined
+            if (isOversizedInline(o.vnBackground)) o.vnBackground = undefined
+            return o
+          })
+        : req.maps
+      const created = store.importMaps(roomId, maps)
+      const room = store.getRoom(roomId)
+      if (room) for (const map of created) broadcastMapAdded(room, roomId, map)
+      // 동반된 통합 레이어(방 상주 패널) — 토큰 인라인 이미지도 배경과 같은 기준으로 방어(업로드 실패
+      // 폴백의 거대 data URL 이 방 상주 상태·스냅샷에 박히지 않게 이미지 필드만 떨군다).
+      const globalsRaw = Array.isArray(req.globalTokens)
+        ? req.globalTokens.map((t) => {
+            if (!t || typeof t !== 'object') return t
+            const o = t as unknown as Record<string, unknown>
+            if (isOversizedInline(o.image)) o.image = undefined
+            if (isOversizedInline(o.backImage)) o.backImage = undefined
+            return t
+          })
+        : req.globalTokens
+      // z 보존을 위해 일괄 저장. 신규 토큰이라 아무도 가진 적이 없으므로 못 보는 참가자에게는 아무것도
+      // 보내지 않는다(broadcastTokenState 의 token:remove 레그는 갱신용 — 여기서는 무의미한 no-op).
+      // 표시 맵 제한은 재발급된 실제 맵 id 로 서버가 다시 묶는다(importGlobalTokens 가 항상 재부여 —
+      // 맵이 하나도 안 들어왔으면 전체 표시로 해제).
+      const globals = store.importGlobalTokens(
+        roomId,
+        globalsRaw,
+        created.length ? created.map((m) => m.id) : undefined
+      )
+      if (room) emitGlobalTokens(room, roomId, globals)
+    })
+
+    // ===== 저장 슬롯 (GM 전용) — 현재 반면을 이름 붙여 저장 / 로드(전원 재싱크) / 삭제 =====
+    on('map:save', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      const slots = store.saveSlot(roomId, req?.name)
+      if (slots) io.to(roomId).emit('map:slots', { slots }) // 성공 시 목록 갱신(꽉 차면 undefined → 무동작)
+    })
+    on('map:load', async (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.slotId !== 'string') return
+      if (!store.loadSlot(roomId, req.slotId)) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      // 슬롯 로드는 반면을 통째 교체 — 참가자별 필터 스냅샷으로 전원 풀 재싱크(공개범위·가시성 보존).
+      for (const p of room.participants.values())
+        io.to('user:' + p.playerId).emit('room:sync', await lightenAvatarPool(store.snapshot(room, p)))
+      io.to(roomId).emit('map:slots', { slots: store.saveSlotsMeta(roomId) })
+    })
+    on('map:slotdelete', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.slotId !== 'string') return
+      const slots = store.deleteSlot(roomId, req.slotId)
+      if (slots) io.to(roomId).emit('map:slots', { slots })
+    })
+
+    // ===== 비주얼 카드 — GM 등록·삭제·수동 재생 =====
+    on('card:set', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId) return
+      const cards = store.setVisualCard(roomId, req)
+      if (cards) io.to(roomId).emit('room:cards', { cards })
+    })
+    on('card:delete', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const cards = store.deleteVisualCard(roomId, req.id)
+      if (cards) io.to(roomId).emit('room:cards', { cards })
+    })
+    on('card:play', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const card = store.getVisualCard(roomId, req.id)
+      if (card) io.to(roomId).emit('room:cardplay', { card }) // 전원 화면에 오버레이 재생
+    })
+    // 토큰 클릭 연출 — 참가자 전용 창구(GM 불요). 카드 id 를 요청에서 받지 않고 '그 토큰에 GM 이
+    // 묶어 둔 카드(clickCardId)'를 서버에서 찾아 재생한다 — 임의 카드 위조 방송 차단. 통합 레이어
+    // 토큰은 요청 맵에 없으므로 GLOBAL 폴백. 카드별 짧은 스로틀로 연타 도배를 막는다.
+    on('card:trigger', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.tokenId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const token =
+        store.getToken(roomId, req.mapId, req.tokenId) ??
+        store.getToken(roomId, GLOBAL_MAP_ID, req.tokenId)
+      if (!token?.clickCardId) return
+      // 앞면을 볼 수 있는 뷰어만 — 뒷면/비공개 토큰의 와이어 표현은 묶임을 벗겨 보내므로(tokenForViewer)
+      // 정상 클라는 애초에 못 쏘지만, 조작 클라가 id 만으로 GM 이 감춘 연출을 강제 재생하는 길을 서버가 막는다.
+      if (!canSeeToken(token, { playerId, role: me.role })) return
+      const card = store.getVisualCard(roomId, token.clickCardId)
+      if (!card) return
+      const key = roomId + ':' + card.id
+      const now = Date.now()
+      const last = cardTriggerAt.get(key) ?? 0
+      if (now - last < CARD_TRIGGER_COOLDOWN_MS) return
+      if (cardTriggerAt.size > 2000) cardTriggerAt.clear() // 방·카드 조합 누적 방지(쿨다운 짧아 리셋 무해)
+      cardTriggerAt.set(key, now)
+      io.to(roomId).emit('room:cardplay', { card })
+    })
+
+    // ===== 덱(카드 뭉치) =====
+    // 만들기/고치기·삭제·섞기는 GM 만. 뽑기는 덱의 who 설정에 따라 전원 또는 GM.
+    // 남은 더미도 뽑기도 서버에만 둔다 — 클라이언트가 결과를 만들어 보내면 남은 장수를 무시하고
+    // 얼마든지 뽑아낼 수 있고, 두 사람이 같은 순간에 뽑으면 같은 카드가 두 번 나온다.
+    const broadcastDeck = (roomId: string, deckId: string): void => {
+      const room = store.getRoom(roomId)
+      if (!room) return
+      // 카드 목록을 감춘 덱·비밀 뽑기는 사람마다 보이는 몫이 다르다 — 참가자별로 제 몫을 보낸다.
+      // 개인 룸은 방을 가리지 않으므로 방 표식을 실어 보낸다(받는 쪽이 제 방 것만 받아들인다).
+      for (const p of room.participants.values()) {
+        if (!p.connected) continue // 자리를 뜬 사람에게 보낼 곳이 없다 — 다시 들어오면 스냅샷으로 받는다
+        const view = store.decksFor(roomId, p).find((d) => d.id === deckId)
+        if (view) io.to('user:' + p.playerId).emit('deck:state', { deck: view, roomId })
+      }
+    }
+
+    on('deck:upsert', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.name !== 'string') return
+      const deck = store.upsertDeck(roomId, req)
+      if (deck) broadcastDeck(roomId, deck.id)
+    })
+
+    on('deck:delete', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.id !== 'string') return
+      if (store.deleteDeck(roomId, req.id)) io.to(roomId).emit('deck:remove', { id: req.id, roomId })
+    })
+
+    on('deck:shuffle', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const deck = store.shuffleDeck(roomId, req.id)
+      if (deck) broadcastDeck(roomId, deck.id)
+    })
+
+    on('deck:draw', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      const sender = room?.participants.get(playerId)
+      if (!room || !sender) return // 방 밖 소켓 무시(위조 방지)
+      const deck = store.getDeck(roomId, req.id)
+      if (!deck) return
+      if (deck.who === 'gm' && sender.role !== 'GM') return // 뽑기 권한은 서버가 판정한다
+      // 비밀 뽑기는 버린 더미에도 각인해 둔다 — 채팅만 가리고 덱 창을 그대로 두면 무엇이 나왔는지 전원이 본다.
+      const secret = req.secret === true
+      const res = store.drawFromDeck(roomId, req.id, typeof req.count === 'number' ? req.count : 1, secret ? playerId : undefined)
+      if (!res) return
+      broadcastDeck(roomId, deck.id)
+      if (!deck.announce) return // 채팅에 남기지 않는 덱 — 뽑은 사실은 덱 창의 버린 더미로만 남는다
+
+      const identity = room.characters.get(playerId)
+      const names = res.cards.map((c) => c.name).join(', ')
+      const message: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel: 'main',
+        kind: 'deck',
+        author: identity?.name || sender.nick,
+        playerId,
+        color: identity?.color || sender.color,
+        avatar: presenceHeadshot(identity), // 발화 당시 두상 각인
+        nameColor: identity?.nameColor,
+        deck: {
+          deckName: deck.name,
+          cards: res.cards.map((c) => ({ name: c.name, image: c.image, text: c.text })),
+          remaining: deck.draw.length
+        },
+        // 비밀 뽑기는 GM 과 뽑은 사람만 본다(비밀 굴림과 같은 규칙).
+        secret: secret || undefined,
+        // 이 종류를 모르는 구버전 프로그램에서도 읽히게 평문을 함께 싣는다(빈 줄로 뜨는 것 방지).
+        // 덤으로 채팅 검색에도 걸린다(검색은 text 만 본다).
+        text: `[${deck.name}] ${names} (남은 ${deck.draw.length}장)`
+      }
+      store.addMessage(roomId, message)
+      for (const target of messageAudience(room, message)) io.to(target).emit('chat:new', message)
+    })
+
+    on('map:delete', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.deleteMap(roomId, req.mapId)
+      if (res) {
+        io.to(roomId).emit('map:removed', { mapId: res.removed })
+        io.to(roomId).emit('map:active', { mapId: res.activeMapId })
+      }
+    })
+
+    on('map:rename', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.renameMap(roomId, req.mapId, typeof req.name === 'string' ? req.name : '')
+      if (res) io.to(roomId).emit('map:renamed', res)
+    })
+
+    on('map:activate', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const active = store.setActiveMap(roomId, req.mapId)
+      if (active) io.to(roomId).emit('map:active', { mapId: active })
+    })
+
+    on('map:background', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      // 배경 이미지는 'asset:' 참조여야 함 — 거대 인라인(업로드 실패 폴백)은 스냅샷·방송을 부풀려 떨군다(+로그).
+      if (req.bg && isOversizedInline((req.bg as { image?: unknown }).image)) {
+        log('drop', 'map:background oversized inline', playerId.slice(0, 8))
+        return
+      }
+      const stored = store.setBackground(roomId, req.mapId, req.bg ?? null)
+      if (stored !== undefined) io.to(roomId).emit('map:background', { mapId: req.mapId, bg: stored })
+    })
+
+    // 비주얼 노벨 무대 배경(맵별, GM 전용). image 없으면 해제. 전원 동기화.
+    on('map:vnbg', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      if (isOversizedInline(req.image)) {
+        log('drop', 'map:vnbg oversized inline', playerId.slice(0, 8))
+        return
+      }
+      const res = store.setVnBackground(
+        roomId,
+        req.mapId,
+        typeof req.image === 'string' ? req.image : undefined
+      )
+      if (res.ok) io.to(roomId).emit('map:vnbg', { mapId: req.mapId, image: res.image })
+    })
+
+    // 비주얼 노벨 배경 흐림 강도(맵별, GM 전용 · 0=없음). 배경 이미지는 건드리지 않고
+    // 흐림 숫자만 전용 이벤트로 동기화 — 이미지 재전송/재하이드레이션 낭비 없음.
+    on('map:vnbgblur', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.blur !== 'number') return
+      const res = store.setVnBgBlur(roomId, req.mapId, req.blur)
+      if (res.ok) io.to(roomId).emit('map:vnbgblur', { mapId: req.mapId, blur: res.blur ?? 0 })
+    })
+
+    // 맵 배경 단색(맵별, GM 전용 · 여백 전체). color 없으면 해제(투명). 전원 동기화.
+    on('map:bgcolor', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.setMapBgColor(
+        roomId,
+        req.mapId,
+        typeof req.color === 'string' ? req.color : undefined
+      )
+      if (res.ok) io.to(roomId).emit('map:bgcolor', { mapId: req.mapId, color: res.color })
+    })
+
+    // 맵 바탕(최후면 이미지+블러 · 맵별, GM 전용 · 화면 전체). backdrop null 이면 해제. 전원 동기화.
+    on('map:backdrop', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.setMapBackdrop(roomId, req.mapId, req.backdrop ?? null)
+      if (res.ok) io.to(roomId).emit('map:backdrop', { mapId: req.mapId, backdrop: res.backdrop ?? null })
+    })
+
+    // 맵세트 메타(전환 문구·크로스페이드) 전체 교체(GM 전용). 전원 동기화.
+    on('map:meta', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.setMapMeta(roomId, req.mapId, { crossfade: req.crossfade === true })
+      if (res.ok) io.to(roomId).emit('map:meta', { mapId: req.mapId, crossfade: res.crossfade })
+    })
+
+    // 맵 레이어 표시/숨김(GM 전용) — 무대 앞 밴드·무대 뒤를 맵 단위로 전원 동기화.
+    on('map:layervis', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.setMapLayerVis(roomId, req.mapId, req.hidden)
+      if (res.ok) io.to(roomId).emit('map:layervis', { mapId: req.mapId, hidden: res.hidden ?? [] })
+    })
+
+    // 맵세트 번들 BGM 저장/해제(GM 전용). save=현재 방 BGM 을 이 맵에 스냅샷, clear=해제. 전원 동기화.
+    on('map:bgm', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const op = req.op === 'clear' ? 'clear' : 'save'
+      const res = store.setMapBgm(roomId, req.mapId, op)
+      if (res.ok) io.to(roomId).emit('map:bgm', { mapId: req.mapId, bgm: res.bgm ?? null })
+    })
+
+    // VN 무대 레이어 스택 전체 교체(GM 전용). 서버가 정규화 후 전원 동기화.
+    on('map:vnlayers', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const res = store.setVnLayers(roomId, req.mapId, req.layers)
+      if (res.ok) io.to(roomId).emit('map:vnlayers', { mapId: req.mapId, layers: res.layers ?? [] })
+    })
+
+    on('map:grid', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string' || !req.grid) return
+      const stored = store.setGrid(roomId, req.mapId, req.grid)
+      if (stored) io.to(roomId).emit('map:grid', { mapId: req.mapId, grid: stored })
+    })
+
+    on('token:upsert', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const token = store.upsertToken(roomId, req.mapId, req)
+      const room = store.getRoom(roomId)
+      if (token && room) broadcastTokenState(room, roomId, req.mapId, token)
+    })
+
+    // 참가자 오브젝트 배치 — 방 설정(plObjects) 켬일 때만. 필드 화이트리스트·소유자 검증·상한은 placePlToken 이
+    // 담당하고(신규엔 ownerPlayerId 스탬프), 이미지 캡은 GM 경로와 같은 upsertToken 병합을 그대로 지난다.
+    on('token:place:pl', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      if (room.plObjects !== true) return // 방 설정 꺼짐 — 조용히 무시(구클라·꺼진 뒤 늦게 온 요청)
+      const token = store.placePlToken(roomId, req.mapId, playerId, req)
+      if (token) broadcastTokenState(room, roomId, req.mapId, token)
+    })
+
+    on('token:move', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      if (!isFiniteCoord(req.x) || !isFiniteCoord(req.y)) return // NaN/Infinity 거부(저장은 moveToken 이 클램프)
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      // 이동 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
+        return
+      const moved = store.moveToken(roomId, req.mapId, req.id, req.x, req.y)
+      if (moved) {
+        const payload = { mapId: req.mapId, id: moved.id, x: moved.x, y: moved.y }
+        // 위치는 앞·뒷면 어느 쪽이든 보유자에게(needFront=false).
+        emitToTokenViewers(room, roomId, moved, false, (target) => io.to(target).emit('token:move', payload))
+      }
+    })
+
+    // 토큰 회전(GM 또는 토큰 소유 PL — 이동과 동일 권한). 각도만 전송·브로드캐스트.
+    on('token:rotate', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      if (!isFiniteCoord(req.rotation)) return // NaN/Infinity 거부
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      // 회전 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
+        return
+      const rotated = store.rotateToken(roomId, req.mapId, req.id, req.rotation)
+      if (rotated) {
+        const payload = { mapId: req.mapId, id: rotated.id, rotation: rotated.rotation ?? 0 }
+        // 각도는 앞·뒷면 어느 쪽이든 보유자에게(needFront=false).
+        emitToTokenViewers(room, roomId, rotated, false, (target) =>
+          io.to(target).emit('token:rotate', payload)
+        )
+      }
+    })
+
+    // 토큰 크기조정(GM 또는 토큰 소유 PL — 이동과 동일 권한). 크기(칸)만 전송·브로드캐스트(크기조정 드래그 라이브).
+    on('token:resize', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      if (!isFiniteCoord(req.size)) return // NaN/Infinity 거부(저장은 resizeToken 이 클램프)
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      // 크기조정 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
+        return
+      const resized = store.resizeToken(roomId, req.mapId, req.id, req.size)
+      if (resized) {
+        const payload = { mapId: req.mapId, id: resized.id, size: resized.size ?? 1 }
+        // 크기는 앞·뒷면 어느 쪽이든 보유자에게(needFront=false).
+        emitToTokenViewers(room, roomId, resized, false, (target) =>
+          io.to(target).emit('token:resize', payload)
+        )
+      }
+    })
+
+    // 이미지 카드 표시 이미지 전환(GM 또는 토큰 소유 PL — 이동과 동일 권한). index 만 전송·브로드캐스트.
+    on('token:imageindex', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      if (!Number.isInteger(req.index) || req.index < 0) return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      // 전환 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
+        return
+      const t = store.setTokenImageIndex(roomId, req.mapId, req.id, req.index)
+      if (t) {
+        const payload = { mapId: req.mapId, id: t.id, index: t.currentIndex ?? 0 }
+        // 이미지 카드 전환은 앞면 보유자에게만(뒷면 뷰어는 무관·needFront=true).
+        emitToTokenViewers(room, roomId, t, true, (target) => io.to(target).emit('token:imageindex', payload))
+      }
+    })
+
+    // 토큰 삭제 — GM 은 모든 토큰, PL 은 자기가 올린 오브젝트만(map:text:remove 와 같은 규칙).
+    on('token:remove', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      if (me.role !== 'GM' && token.ownerPlayerId !== playerId) return
+      const prev = store.removeToken(roomId, req.mapId, req.id)
+      if (prev) io.to(roomId).emit('token:remove', { mapId: req.mapId, id: prev.id })
+    })
+
+    // 토큰 z순서·레이어 변경(GM 전용). 변경된 토큰(교환 시 2개)을 각각 token:state 로 전원 동기화.
+    on('token:reorder', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      const changed = store.reorderToken(roomId, req.mapId, req.id, {
+        op: req.op,
+        layer: req.layer,
+        sceneMapId: typeof req.sceneMapId === 'string' ? req.sceneMapId : undefined,
+        targetId: typeof req.targetId === 'string' ? req.targetId : undefined,
+        side: req.side === 'front' || req.side === 'back' ? req.side : undefined
+      })
+      const room = store.getRoom(roomId)
+      // 한 줄에 통합 레이어와 맵 레이어가 섞여 있으므로, 방송은 토큰마다 제 컬렉션으로 나가야 한다 —
+      // 요청에 실린 mapId 로 뭉뚱그리면 통합 레이어가 그 맵의 토큰으로 복제된다.
+      if (room) for (const c of changed) broadcastTokenState(room, roomId, c.mapId, c.token)
+    })
+
+    // ===== 자유 드로잉·핑 =====
+    // 그리기=전원(방 참가자), 색·playerId 는 서버가 참가자 정보로 스탬프(위조 방지).
+    on('map:draw', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      // 그리기 색은 작성자가 고른 색을 우선 사용(휘발성 드로잉 — 길이만 캡). 없으면 참가자색.
+      const color = typeof req.color === 'string' && req.color ? req.color.slice(0, 32) : me.color
+      const stroke = store.addStroke(roomId, req.mapId, req, { playerId, color })
+      if (stroke) io.to(roomId).emit('map:draw', { mapId: req.mapId, stroke })
+    })
+
+    // 지우개=작성자 또는 GM(서버 검증).
+    on('map:draw:erase', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.strokeId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const stroke = store.getStroke(roomId, req.mapId, req.strokeId)
+      if (!stroke) return
+      if (me.role !== 'GM' && stroke.playerId !== playerId) return // PL 은 자기 획만
+      const removed = store.eraseStroke(roomId, req.mapId, req.strokeId)
+      if (removed) io.to(roomId).emit('map:draw:erase', { mapId: req.mapId, strokeId: removed.id })
+    })
+
+    // 전체 지우기=GM 전용.
+    on('map:draw:clear', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      if (store.clearDrawings(roomId, req.mapId)) io.to(roomId).emit('map:draw:clear', { mapId: req.mapId })
+    })
+
+    // ===== 맵 텍스트 라벨 =====
+    // 생성=전원(작성자=서버 스탬프), 편집=작성자 또는 GM(서버 검증).
+    on('map:text', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      // 편집(id 있음)이면 작성자/GM 만. 신규(id 없음)는 전원 허용.
+      if (typeof req.id === 'string' && req.id) {
+        const existing = store.getText(roomId, req.mapId, req.id)
+        if (existing && me.role !== 'GM' && existing.playerId !== playerId) return
+      }
+      const text = store.upsertText(roomId, req.mapId, req, { playerId })
+      if (text) io.to(roomId).emit('map:text:state', { mapId: req.mapId, text })
+    })
+
+    // 이동=작성자 또는 GM.
+    on('map:text:move', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      if (!isFiniteCoord(req.x) || !isFiniteCoord(req.y)) return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const t = store.getText(roomId, req.mapId, req.id)
+      if (!t) return
+      if (me.role !== 'GM' && t.playerId !== playerId) return // PL 은 자기 텍스트만
+      const moved = store.moveText(roomId, req.mapId, req.id, req.x, req.y)
+      if (moved)
+        io.to(roomId).emit('map:text:move', { mapId: req.mapId, id: moved.id, x: moved.x, y: moved.y })
+    })
+
+    // 삭제=작성자 또는 GM.
+    on('map:text:remove', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const t = store.getText(roomId, req.mapId, req.id)
+      if (!t) return
+      if (me.role !== 'GM' && t.playerId !== playerId) return // PL 은 자기 텍스트만
+      const removed = store.removeText(roomId, req.mapId, req.id)
+      if (removed) io.to(roomId).emit('map:text:remove', { mapId: req.mapId, id: removed.id })
+    })
+
+    // 텍스트 전체 지우기=GM 전용.
+    on('map:text:clear', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      if (store.clearTexts(roomId, req.mapId)) io.to(roomId).emit('map:text:clear', { mapId: req.mapId })
+    })
+
+    // 핑=전원(휘발 — 저장하지 않고 방 전체에 브로드캐스트만). 색·playerId 는 서버 스탬프.
+    on('map:ping', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      if (!isFiniteCoord(req.x) || !isFiniteCoord(req.y)) return // NaN/Infinity 거부
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      io.to(roomId).emit('map:ping', {
+        mapId: req.mapId,
+        x: clampCoord(req.x),
+        y: clampCoord(req.y),
+        playerId,
+        // 본인 지정 이름색을 핑색으로. 없으면 참가자 기본색. 휘발 이벤트라 클라색 신뢰(길이만 캡).
+        color: typeof req.color === 'string' && req.color ? req.color.slice(0, 32) : me.color
+      })
+    })
+
+    on('room:leave', () => {
+      if (!socket.data.roomId) return
+      leaveCurrentRoom() // 소켓룸·참가자·위치/뷰맵 공통 정리(방 입장 핸들러의 자동 퇴장과 동일 경로)
+      if (account) syncPresence(account.id) // '세션중' 자동 해제
+    })
+
+    // ===== 수동 프레즌스 상태 — 온라인/자리비움/세션중/오프라인 표시(계정 영속). =====
+    on('presence:set', (req, ack) => {
+      const acct = socket.data.account
+      const status = req?.status
+      if (!acct || typeof status !== 'string' || !['online', 'away', 'session', 'invisible'].includes(status)) {
+        ack?.({ ok: false, error: '상태를 변경할 수 없습니다.' })
+        return
+      }
+      // 레이트리밋 — 상태 토글 폭주가 accounts.json 동기쓰기·전역 브로드캐스트를 반복시키지 않게(계정당 10초 20건).
+      const t = Date.now()
+      const rl = presenceRate.get(acct.id)
+      if (!rl || t > rl.resetAt) {
+        presenceRate.set(acct.id, { count: 1, resetAt: t + 10_000 })
+      } else if (rl.count >= 20) {
+        ack?.({ ok: false, error: '너무 자주 변경했어요. 잠시 후 다시 시도하세요.' })
+        return
+      } else {
+        rl.count++
+      }
+      auth.setStatus(acct.id, status as PresenceStatus)
+      syncPresence(acct.id) // 표시 상태 전이 브로드캐스트(invisible→오프라인 위장 포함)
+      ack?.({ ok: true, data: { status: status as PresenceStatus } })
+    })
+
+    // ===== 도트타운 광장(Plaza) — 휘발 멀티플레이 =====
+    // 입장: 손님 포함 누구나 걸을 수 있다(구매/판매만 member↑). 외형은 서버 보관 CharSave 를 동봉(클라 주입 안 함).
+    on('plaza:enter', (req, ack) => {
+      const nick = (account && displayNick(account.id)) || '손님'
+      const look = account ? dottown.getChar(account.id) : null
+      // 스폰 위치 — spawnAtOwnerId 의 집 현관 앞(내 집=내 id, 방문 복귀=방문한 집 주인 id). 그 집이 없으면 중앙.
+      const spawnOwner = typeof req?.spawnAtOwnerId === 'string' ? req.spawnAtOwnerId : null
+      const spawnLot = spawnOwner ? estate.myLot(spawnOwner) : null
+      const spawnCell = spawnLot ? { cx: spawnLot.cx, cy: spawnLot.cy } : undefined
+      const r = plaza.enter(playerId, nick, look, socket.id, spawnCell)
+      if (!r.ok) {
+        ack?.({ ok: false, error: r.error })
+        return
+      }
+      void socket.join('plaza:' + r.joined.plazaId)
+      socket.data.plazaId = r.joined.plazaId
+      ack?.({ ok: true, data: { ...r.joined, lots: estate.lots() } }) // 부동산 빈터 스냅샷 동봉(허브는 모름)
+      // 알바 중 입장이면 "영업 중"으로 표시(다음 틱에 주변 전파). self 는 economy HUD 로 별도 표시.
+      if (account && economy.isWorking(account.id))
+        plaza.setWorking(playerId, true, economy.jobOf(account.id)?.shopId, { nick, look })
+    })
+    on('plaza:leave', () => {
+      const plazaId = socket.data.plazaId
+      if (plazaId) void socket.leave('plaza:' + plazaId)
+      socket.data.plazaId = undefined
+      plaza.leave(playerId, socket.id)
+    })
+    // 이동 의도(고빈도) — 서버가 인접·쿨다운·경계 검증 후 다음 틱에 반영(거부=무시).
+    // 알바 중엔 이동 불가(점원 고정·마이룸 비움) — 서버 게이트(클라 잠금의 안티치트 백업).
+    on('plaza:move', (req) => {
+      if (socket.data.plazaId && !(account && economy.isWorking(account.id))) plaza.move(playerId, req)
+    })
+    // 잡담 — 서버가 길이·도배 검증 후 광장 룸으로 말풍선+로그 송출.
+    on('plaza:say', (req) => {
+      const plazaId = socket.data.plazaId
+      if (!plazaId) return
+      const r = plaza.say(playerId, req?.text)
+      if (r.ok && r.msg) io.to('plaza:' + plazaId).emit('plaza:msg', r.msg)
+    })
+    // 이모트 — 서버가 화이트리스트·쿨다운 검증 후 광장 룸으로 브로드캐스트.
+    on('plaza:emote', (req) => {
+      const plazaId = socket.data.plazaId
+      if (!plazaId) return
+      const r = plaza.emote(playerId, req?.emote)
+      if (r.ok && r.emote) io.to('plaza:' + plazaId).emit('plaza:emote', { playerId, emote: r.emote })
+    })
+
+    // ===== 도트타운 마이룸 실시간 방문 — 휘발 멀티플레이 =====
+    // 입장: 손님 포함 누구나 방문·걷기 가능. roomId=방 주인 id. 외형은 서버 보관 CharSave 동봉(위조 방지). 방 존재 여부 확인.
+    on('roomvisit:enter', (req, ack) => {
+      const roomId = typeof req?.roomId === 'string' ? req.roomId : ''
+      if (!roomId || !auth.getAccountById(roomId)) {
+        ack?.({ ok: false, error: '방을 찾을 수 없어요.' })
+        return
+      }
+      // 비공개 계정의 마이룸은 친구만 — HTTP 열람과 같은 잣대로 실시간 방문도 막는다.
+      if (!auth.canViewLobby(account?.id ?? null, roomId)) {
+        ack?.({ ok: false, error: '비공개 계정이라 친구만 들어갈 수 있어요.' })
+        return
+      }
+      // 알바 근무 중엔 마이룸 라이브에 참가할 수 없다(캐릭터는 광장 상점에 있음) — 내 방/남의 방 모두 차단.
+      if (account && economy.isWorking(account.id)) {
+        ack?.({ ok: false, error: '알바 근무 중에는 마이룸에 들어갈 수 없어요.' })
+        return
+      }
+      const nick = (account && displayNick(account.id)) || '손님'
+      const look = account ? dottown.getChar(account.id) : null
+      const prev = socket.data.visitRoomId
+      if (prev && prev !== roomId) void socket.leave('roomvisit:' + prev) // 다른 방 방문 중이었으면 그 소켓룸에서 나감
+      const r = roomVisit.enter(roomId, playerId, nick, look, socket.id)
+      if (!r.ok) {
+        ack?.({ ok: false, error: r.error })
+        return
+      }
+      void socket.join('roomvisit:' + roomId)
+      socket.data.visitRoomId = roomId
+      ack?.({ ok: true, data: r.joined })
+    })
+    on('roomvisit:leave', () => {
+      const roomId = socket.data.visitRoomId
+      if (roomId) void socket.leave('roomvisit:' + roomId)
+      socket.data.visitRoomId = undefined
+      roomVisit.leave(playerId, socket.id)
+    })
+
+    // ===== 커뮤니티 — 보고 있는 게시판·글의 룸으로 갈아탄다 =====
+    // ⚠들어가기 전에 반드시 이전 룸을 떠난다. 안 그러면 화면을 옮길 때마다 소속이 쌓여
+    //   상관없는 게시판의 사건까지 계속 받게 된다.
+    const cmtyLeave = (): void => {
+      for (const r of socket.data.cmtyRooms ?? []) void socket.leave(r)
+      socket.data.cmtyRooms = []
+    }
+    on('cmty:watch', (req) => {
+      cmtyLeave()
+      const acct = socket.data.account
+      if (!acct) return
+      const rooms: string[] = ['cmty:main']
+      const boardId = typeof req?.boardId === 'string' ? req.boardId : ''
+      const postId = typeof req?.postId === 'string' ? req.postId : ''
+      // 존재만 보고 들여보내면 숨긴 게시판의 활동이 그대로 새 나간다 — 읽을 수 있는 사람만 들인다.
+      const permCtx = {
+        accountId: acct.id,
+        isAppAdmin: acct.role === 'admin',
+        member: community.member(acct.id),
+        now: Date.now()
+      }
+      const board = community.board(boardId)
+      if (board && community.can('board.read', { ...permCtx, board })) rooms.push('cmtyb:' + boardId)
+      if (postId) {
+        const sum = cmtyPosts.summary(postId)
+        const pb = sum ? community.board(sum.boardId) : null
+        if (pb && community.can('board.read', { ...permCtx, board: pb })) rooms.push('cmtyp:' + postId)
+      }
+      for (const r of rooms) void socket.join(r)
+      socket.data.cmtyRooms = rooms
+    })
+    on('cmty:unwatch', cmtyLeave)
+    // 이동 의도(고빈도) — 서버가 인접·쿨다운·바닥경계 검증 후 다음 틱 반영(거부=권위좌표 재송출).
+    on('roomvisit:move', (req) => {
+      const rid = socket.data.visitRoomId
+      if (rid) roomVisit.move(rid, playerId, req)
+    })
+    // 잡담 — 서버가 길이·도배 검증 후 그 방 소켓룸으로 말풍선+로그 송출.
+    on('roomvisit:say', (req) => {
+      const rid = socket.data.visitRoomId
+      if (!rid) return
+      const r = roomVisit.say(rid, playerId, req?.text)
+      if (r.ok && r.msg) io.to('roomvisit:' + rid).emit('roomvisit:msg', r.msg)
+    })
+    // 이모트 — 화이트리스트·쿨다운 검증 후 그 방 소켓룸으로 브로드캐스트.
+    on('roomvisit:emote', (req) => {
+      const rid = socket.data.visitRoomId
+      if (!rid) return
+      const r = roomVisit.emote(rid, playerId, req?.emote)
+      if (r.ok && r.emote) io.to('roomvisit:' + rid).emit('roomvisit:emote', { playerId, emote: r.emote })
+    })
+
+    on('disconnect', (reason) => {
+      log('disconnect', playerId.slice(0, 8), reason, 'sockets', io.sockets.sockets.size)
+      // 광장 정리 — 이 소켓이 광장 액터의 현재 소켓이면 퇴장 브로드캐스트 예약(더 새 소켓이 이어받았으면 유지).
+      plaza.disconnect(playerId, socket.id)
+      // 마이룸 방문 정리 — 동일 시맨틱(마지막 소켓이면 그 방에서 퇴장).
+      roomVisit.disconnect(playerId, socket.id)
+      // 전역 프레즌스 정리 — 이 계정의 마지막 소켓이 끊기면 오프라인 알림(위장 오프라인이었으면 무음).
+      if (account) {
+        auth.touchSeen(account.id) // 마지막 접속 = 마지막으로 연결돼 있던 시각(관리자 서버관리 표시)
+        const set = presence.get(account.id)
+        if (set) {
+          set.delete(socket.id)
+          if (set.size === 0) {
+            presence.delete(account.id)
+            dmRate.delete(account.id) // 마지막 소켓 종료 → DM 레이트리밋 항목도 정리(누수 방지)
+            dmReadRate.delete(account.id)
+            presenceRate.delete(account.id)
+          }
+        }
+        // 마지막 소켓이 아니어도 이 소켓이 세션방 소켓이었으면 '세션중' 해제 가능 — 재계산으로 일괄 처리.
+        syncPresence(account.id)
+      }
+      const roomId = socket.data.roomId
+      if (!roomId) return
+      // 연결만 끊김 → 참가자 유지(재접속 대기), 나머지에게 connected=false 알림.
+      // 휘발 위치·뷰맵은 여기서 지우지 않는다 — 세션 복구(connectionStateRecovery) 재접속은 위치를 자동 재보고하지
+      // 않으므로, 지우면 잠깐 끊겼다 복구된 플레이어의 GM 위치 마커가 사라진다. 정리는 명시적 퇴장(room:leave)에서만.
+      // (항목은 playerId 키라 재입장 시 덮어써지고, 참가자 목록과 대조(emitPositions)되므로 무한 누적되지 않는다.)
+      //
+      // 참가자는 계정 단위 한 칸이므로, 같은 계정이 웹·프로그램 등 여러 창으로 들어와 있으면 그중 하나가
+      // 끊겼다고 계정 전체를 오프라인으로 내려선 안 된다(귓속말 대상에서 사라지고 되돌릴 길도 없다).
+      // 이 방에 남아 있는 같은 계정의 다른 소켓을 세어 마지막 하나일 때만 내린다.
+      // socket.io 는 이 소켓을 목록에서 뺀 뒤 disconnect 를 알리므로 자기 자신은 이미 빠져 있다(id 비교는 이중 안전장치).
+      let stillHere = false
+      for (const s of io.sockets.sockets.values()) {
+        if (s.id !== socket.id && s.data.playerId === playerId && s.data.roomId === roomId) {
+          stillHere = true
+          break
+        }
+      }
+      if (stillHere) {
+        // 남아 있는 창이 있으면 오히려 온라인으로 되돌린다 — 먼저 끊긴 척하던 옛 소켓의 늦은 종료가
+        // 새 소켓이 방금 켜 놓은 접속 표시를 덮어 영영 오프라인으로 굳는 것을 막는다(이미 온라인이면 그대로).
+        store.markConnected(roomId, playerId)
+      } else {
+        store.markDisconnected(roomId, playerId)
+      }
+      broadcastParticipants(roomId)
+    })
+  })
+
+  // 주기 진단(로거 주입 시만) — 소켓 수·메모리(RSS/heap)·방 수 추이로 누수/폭주를 호스트 로그에서 추적. unref 로 종료를 막지 않음.
+  if (opts?.log) {
+    // 메모리로 죽는 것은 예외가 아니라서 어떤 그물로도 못 받는다 — 프로세스가 그냥 사라지고 접속자
+    // 전원이 함께 끊긴다. 숫자가 올라가는 것만 남기면 사후에도 원인을 못 짚으므로, 천장을 함께 적어 두고
+    // 가까워지면 미리 크게 알린다(천장을 넘기 전에 손쓸 수 있는 유일한 신호).
+    const heapCapMB = Math.round(getHeapStatistics().heap_size_limit / 1048576)
+    log('heap limit', heapCapMB, 'MB')
+    let warned = false
+    const diag = setInterval(() => {
+      const m = process.memoryUsage()
+      const heapMB = Math.round(m.heapUsed / 1048576)
+      log(
+        'diag',
+        'sockets',
+        io.sockets.sockets.size,
+        'rssMB',
+        Math.round(m.rss / 1048576),
+        'heapMB',
+        heapMB,
+        'heapCapMB',
+        heapCapMB,
+        'rooms',
+        store.roomCount
+      )
+      if (heapMB > heapCapMB * 0.8) {
+        if (!warned) {
+          warned = true
+          console.warn(
+            `[server] ⚠ 메모리가 천장(${heapCapMB}MB)의 80%를 넘었습니다(${heapMB}MB). 이대로 차오르면 ` +
+              '서버가 예고 없이 내려가고 접속해 있던 사람이 전부 끊깁니다.'
+          )
+        }
+      } else if (heapMB < heapCapMB * 0.7) {
+        warned = false // 다시 내려오면 경고를 되살려 둔다(한 번 찍고 영영 조용해지지 않게)
+      }
+    }, 30000)
+    diag.unref()
+    httpServer.on('close', () => clearInterval(diag))
+  }
+
+  return {
+    httpServer,
+    io,
+    store,
+    auth,
+    characters,
+    assets,
+    dm,
+    notif,
+    posts,
+    sessionlogs,
+    dottown,
+    economy,
+    market,
+    listAvatarRefs // ⚠자산 회수에 반드시 실어야 한다 — 안 실으면 DM 목록 프사가 최대 6시간 뒤 사라진다
   }
 }
