@@ -29,6 +29,7 @@ import type {
   ServerToClientEvents,
   SharedCharacter,
   SocketData,
+  TableRoll,
   Token
 } from './protocol'
 import { GLOBAL_MAP_ID, SERVER_VERSION } from './protocol'
@@ -146,6 +147,19 @@ function coerceProfileTheme(v: unknown): ProfileTheme | undefined {
     bg: hex(o.bg)
   }
   return t.accent || t.nameColor || t.bioColor || t.bg ? t : undefined
+}
+
+/** 인세인 표 굴림 결과 방어적 정규화(kind='table') — 광기(madness)와 같은 신뢰 수준으로 중계하되 형식만 검증. */
+function coerceTableRoll(v: unknown): TableRoll | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  const label = typeof o.label === 'string' ? o.label.trim().slice(0, 60) : ''
+  const dice = typeof o.dice === 'string' ? o.dice.trim().slice(0, 20) : ''
+  const entry = typeof o.entry === 'string' ? o.entry.slice(0, 2000) : ''
+  const roll = typeof o.roll === 'number' && Number.isFinite(o.roll) ? o.roll : undefined
+  const sides = typeof o.sides === 'number' && Number.isFinite(o.sides) ? o.sides : undefined
+  if (!label || !dice || !entry || roll === undefined || sides === undefined) return undefined
+  return { label, dice, roll, sides, entry }
 }
 
 /** POST 본문을 JSON 으로 파싱(최대 3MB — 프로필 아바타+배너 이미지 수용). 실패 시 빈 객체. */
@@ -4061,11 +4075,12 @@ export function createRelay(opts?: {
       const sender = room.participants.get(playerId)
       if (!sender) return // 방 밖 소켓 무시 (위조 방지)
 
-      const kind = req.kind === 'madness' ? 'madness' : 'dice'
+      const kind = req.kind === 'madness' ? 'madness' : req.kind === 'table' ? 'table' : 'dice'
       const dice = kind === 'dice' && req.dice && typeof req.dice === 'object' ? req.dice : undefined
       const madness =
         kind === 'madness' && req.madness && typeof req.madness === 'object' ? req.madness : undefined
-      if (!dice && !madness) return // 빈/잘못된 payload 무시
+      const table = kind === 'table' ? coerceTableRoll(req.table) : undefined
+      if (!dice && !madness && !table) return // 빈/잘못된 payload 무시
 
       const id = randomUUID()
       const time = Date.now()
@@ -4081,7 +4096,9 @@ export function createRelay(opts?: {
       const stamp = { id, time, channel, author, playerId, ...(speakerCharId ? { charId: speakerCharId } : {}), color, avatar, nameColor }
       const message: ChatMessage = dice
         ? { ...stamp, kind: 'dice', dice }
-        : { ...stamp, kind: 'madness', madness }
+        : madness
+          ? { ...stamp, kind: 'madness', madness }
+          : { ...stamp, kind: 'table', table: table! }
 
       // 라우팅(chat:send 와 동일): 비밀=GM+본인, 귓속말=대상+본인, 그 외 공개=방 전체. 전부 히스토리 저장.
       if (secret) {
