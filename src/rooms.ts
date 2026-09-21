@@ -151,6 +151,8 @@ export interface RoomMap {
   hiddenLayers?: TokenLayer[] // 숨긴 레이어(무대 앞 밴드·무대 뒤) — GM 설정·맵 단위 전원 동기
   bgm?: BgmState[] // 맵세트 번들 BGM 스냅샷(자산 참조). undefined=미저장, []=무음 저장
   importId?: string // 가져오기 출처 태그 — 같은 파일 배치의 맵·통합 레이어 연동 삭제용(불변)
+  /** 맵세트 목록 표시 순서 — GM 이 드래그로 재배열(reorderMaps). 없으면 생성 순서(맵 등록 순)로 표시. */
+  sortKey?: number
 }
 
 export interface Room {
@@ -972,7 +974,8 @@ function toWireMap(m: RoomMap): GameMap {
     crossfade: m.crossfade,
     hiddenLayers: m.hiddenLayers,
     bgm: m.bgm,
-    importId: m.importId
+    importId: m.importId,
+    sortKey: m.sortKey
   }
 }
 
@@ -3596,6 +3599,49 @@ export class RoomStore {
     return { mapId, name: m.name }
   }
 
+  /**
+   * 맵세트 표시 순서 — sortKey 로 정렬, 없는 맵은 room.maps 등록 순서(안정적 · 재배열해도 안 바뀜)로 폴백.
+   * snapshot() 과 reorderMaps() 가 항상 이 기준으로 동일하게 정렬해야 순서가 어긋나지 않는다.
+   */
+  private orderedMaps(room: Room): RoomMap[] {
+    const list = [...room.maps.values()]
+    return list
+      .map((m, idx) => ({ m, key: m.sortKey ?? idx }))
+      .sort((a, b) => a.key - b.key)
+      .map((x) => x.m)
+  }
+
+  /**
+   * 맵세트 목록 순서 변경 (GM 드래그). order 에 실린 맵 id 순서대로 0..n-1 sortKey 를 새로 매긴다.
+   * order 에 없는(또는 존재하지 않는) 맵은 기존 상대 순서를 지키며 뒤에 붙는다.
+   * 반환은 sortKey 가 실제로 바뀐 맵들만(호출 측이 그대로 재방송) — 없으면 빈 배열, 방이 없으면 undefined.
+   */
+  reorderMaps(roomId: string, order: string[]): GameMap[] | undefined {
+    const room = this.rooms.get(roomId)
+    if (!room) return undefined
+    const validIds = new Set(room.maps.keys())
+    const seen = new Set<string>()
+    const clean = order.filter((id) => {
+      if (typeof id !== 'string' || !validIds.has(id) || seen.has(id)) return false
+      seen.add(id)
+      return true
+    })
+    const rest = this.orderedMaps(room)
+      .map((m) => m.id)
+      .filter((id) => !seen.has(id))
+    const finalOrder = [...clean, ...rest]
+    const changed: GameMap[] = []
+    finalOrder.forEach((id, i) => {
+      const m = room.maps.get(id)
+      if (m && m.sortKey !== i) {
+        m.sortKey = i
+        changed.push(toWireMap(m))
+      }
+    })
+    if (changed.length) room.lastActivityAt = Date.now()
+    return changed
+  }
+
   /** 활성 맵 전환. 새 활성 id 반환, 맵 없으면 undefined. */
   setActiveMap(roomId: string, mapId: string): string | undefined {
     const room = this.rooms.get(roomId)
@@ -4906,7 +4952,7 @@ export class RoomStore {
       avatarPool, // 채팅 두상 풀 — 클라가 avatarRef 복원에 사용
       handouts: viewer ? this.handoutsFor(room, viewer) : [...room.handouts.values()],
       // 공개범위에 따라 뷰어별 표현(앞면/뒷면/미표시)으로 변환한다(클라 은닉 신뢰 X · 와이어 노출 차단).
-      maps: [...room.maps.values()].map((m) => {
+      maps: this.orderedMaps(room).map((m) => {
         const wire = toWireMap(m)
         if (!viewer) return wire
         return {
