@@ -607,6 +607,8 @@ export interface GameMap {
   bgm?: BgmState[]
   /** 가져오기 출처 태그 — 이 맵을 들여온 파일 배치 id. 배치의 마지막 맵이 삭제되면 같은 태그의 통합 레이어도 클라가 함께 정리. */
   importId?: string
+  /** 맵세트 목록 표시 순서(GM 이 드래그로 재배열 · map:reorder 로만 변경). 없으면 등록 순서로 표시. */
+  sortKey?: number
 }
 
 /**
@@ -1230,6 +1232,8 @@ export interface ClientToServerEvents {
   'map:create': (req: { name?: string; baseMapId?: string }) => void
   'map:delete': (req: { mapId: string }) => void
   'map:rename': (req: { mapId: string; name: string }) => void
+  /** 맵세트 목록 순서 변경(GM 전용) — order 에 실린 id 순서대로 재배열. 없는/모르는 id 는 서버가 무시. */
+  'map:reorder': (req: { order: string[] }) => void
   'map:activate': (req: { mapId: string }) => void
   'map:background': (req: { mapId: string; bg: MapBackground | null }) => void
   /** 비주얼 노벨 무대 배경 설정/해제 (GM 전용). image 없으면 해제. */
@@ -1470,6 +1474,8 @@ export interface ServerToClientEvents {
   'room:cardplay': (req: { card: VisualCard }) => void
   'map:removed': (req: { mapId: string }) => void
   'map:renamed': (req: { mapId: string; name: string }) => void
+  /** 맵세트 순서 변경 브로드캐스트 — sortKey 가 실제로 바뀐 맵들만 실려온다(전부가 아님). */
+  'map:reordered': (req: { order: { id: string; sortKey: number }[] }) => void
   'map:active': (req: { mapId: string }) => void
   'map:background': (req: { mapId: string; bg: MapBackground | null }) => void
   'map:vnbg': (req: { mapId: string; image?: string }) => void
