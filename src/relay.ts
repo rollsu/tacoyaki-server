@@ -5363,6 +5363,16 @@ export function createRelay(opts?: {
       if (res) io.to(roomId).emit('map:renamed', res)
     })
 
+    on('map:reorder', (req: { order: string[] }) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req || !Array.isArray(req.order)) return
+      const order = req.order.filter((id: unknown): id is string => typeof id === 'string')
+      const changed = store.reorderMaps(roomId, order)
+      if (changed && changed.length) {
+        io.to(roomId).emit('map:reordered', { order: changed.map((m) => ({ id: m.id, sortKey: m.sortKey ?? 0 })) })
+      }
+    })
+
     on('map:activate', (req) => {
       const roomId = gmRoomId()
       if (!roomId || !req || typeof req.mapId !== 'string') return
